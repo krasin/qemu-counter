@@ -24,4 +24,4 @@
 	url = git://anongit.freedesktop.org/pixman
 [submodule "dtc"]
 	path = dtc
-	url = git://git.qemu.org/dtc.git
+	url = https://github.com/krasin/dtc-counter.git
