@@ -5,8 +5,12 @@
 #define READ_COUNTER_ADDR 0x40050000
 #define READ_COUNTER_SIZE 4
 
+#define TYPE_READ_COUNTER "read_counter"
+#define READ_COUNTER(obj) \
+    OBJECT_CHECK(ReadCounter, (obj), TYPE_READ_COUNTER)
+
 typedef struct {
-  SysBusDevice busdev;
+  SysBusDevice parent_obj;
   MemoryRegion iomem;
   uint32_t count;
 } ReadCounter;
@@ -32,14 +36,11 @@ static const MemoryRegionOps read_counter_ops = {
 
 static int read_counter_init(SysBusDevice *dev)
 {
-  ReadCounter *cnt = FROM_SYSBUS(ReadCounter, dev);
+  ReadCounter *cnt = READ_COUNTER(dev);
   cnt->count = 0;
 
-  memory_region_init_io(&cnt->iomem,
-                        &read_counter_ops,
-                        cnt,
-                        "read_counter",
-                        READ_COUNTER_SIZE);
+  memory_region_init_io(&cnt->iomem, OBJECT(dev), &read_counter_ops, cnt,
+                        TYPE_READ_COUNTER, READ_COUNTER_SIZE);
   sysbus_init_mmio(dev, &cnt->iomem);
   sysbus_mmio_map(dev, 0, READ_COUNTER_ADDR);
   return 0;
@@ -55,7 +56,7 @@ static void read_counter_class_init(ObjectClass *klass, void *data)
 }
 
 static TypeInfo read_counter_info = {
-  .name = "read_counter",
+  .name = TYPE_READ_COUNTER,
   .parent = TYPE_SYS_BUS_DEVICE,
   .instance_size = sizeof(ReadCounter),
   .class_init = read_counter_class_init,
