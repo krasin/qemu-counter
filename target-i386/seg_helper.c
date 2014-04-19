@@ -30,11 +30,11 @@
 
 #ifdef DEBUG_PCALL
 # define LOG_PCALL(...) qemu_log_mask(CPU_LOG_PCALL, ## __VA_ARGS__)
-# define LOG_PCALL_STATE(env)                                  \
-    log_cpu_state_mask(CPU_LOG_PCALL, (env), CPU_DUMP_CCOP)
+# define LOG_PCALL_STATE(cpu)                                  \
+    log_cpu_state_mask(CPU_LOG_PCALL, (cpu), CPU_DUMP_CCOP)
 #else
 # define LOG_PCALL(...) do { } while (0)
-# define LOG_PCALL_STATE(env) do { } while (0)
+# define LOG_PCALL_STATE(cpu) do { } while (0)
 #endif
 
 /* return non zero if error */
@@ -95,6 +95,7 @@ static inline void load_seg_vm(CPUX86State *env, int seg, int selector)
 static inline void get_ss_esp_from_tss(CPUX86State *env, uint32_t *ss_ptr,
                                        uint32_t *esp_ptr, int dpl)
 {
+    X86CPU *cpu = x86_env_get_cpu(env);
     int type, index, shift;
 
 #if 0
@@ -112,11 +113,11 @@ static inline void get_ss_esp_from_tss(CPUX86State *env, uint32_t *ss_ptr,
 #endif
 
     if (!(env->tr.flags & DESC_P_MASK)) {
-        cpu_abort(env, "invalid tss");
+        cpu_abort(CPU(cpu), "invalid tss");
     }
     type = (env->tr.flags >> DESC_TYPE_SHIFT) & 0xf;
     if ((type & 7) != 1) {
-        cpu_abort(env, "invalid tss type");
+        cpu_abort(CPU(cpu), "invalid tss type");
     }
     shift = type >> 3;
     index = (dpl * 4 + 2) << shift;
@@ -782,6 +783,7 @@ static void do_interrupt_protected(CPUX86State *env, int intno, int is_int,
 
 static inline target_ulong get_rsp_from_tss(CPUX86State *env, int level)
 {
+    X86CPU *cpu = x86_env_get_cpu(env);
     int index;
 
 #if 0
@@ -790,7 +792,7 @@ static inline target_ulong get_rsp_from_tss(CPUX86State *env, int level)
 #endif
 
     if (!(env->tr.flags & DESC_P_MASK)) {
-        cpu_abort(env, "invalid tss");
+        cpu_abort(CPU(cpu), "invalid tss");
     }
     index = 8 * level + 4;
     if ((index + 7) > env->tr.limit) {
@@ -935,9 +937,11 @@ static void do_interrupt64(CPUX86State *env, int intno, int is_int,
 #if defined(CONFIG_USER_ONLY)
 void helper_syscall(CPUX86State *env, int next_eip_addend)
 {
-    env->exception_index = EXCP_SYSCALL;
+    CPUState *cs = CPU(x86_env_get_cpu(env));
+
+    cs->exception_index = EXCP_SYSCALL;
     env->exception_next_eip = env->eip + next_eip_addend;
-    cpu_loop_exit(env);
+    cpu_loop_exit(cs);
 }
 #else
 void helper_syscall(CPUX86State *env, int next_eip_addend)
@@ -1131,7 +1135,8 @@ static void do_interrupt_user(CPUX86State *env, int intno, int is_int,
 static void handle_even_inj(CPUX86State *env, int intno, int is_int,
                             int error_code, int is_hw, int rm)
 {
-    uint32_t event_inj = ldl_phys(env->vm_vmcb + offsetof(struct vmcb,
+    CPUState *cs = CPU(x86_env_get_cpu(env));
+    uint32_t event_inj = ldl_phys(cs->as, env->vm_vmcb + offsetof(struct vmcb,
                                                           control.event_inj));
 
     if (!(event_inj & SVM_EVTINJ_VALID)) {
@@ -1145,11 +1150,12 @@ static void handle_even_inj(CPUX86State *env, int intno, int is_int,
         event_inj = intno | type | SVM_EVTINJ_VALID;
         if (!rm && exception_has_error_code(intno)) {
             event_inj |= SVM_EVTINJ_VALID_ERR;
-            stl_phys(env->vm_vmcb + offsetof(struct vmcb,
+            stl_phys(cs->as, env->vm_vmcb + offsetof(struct vmcb,
                                              control.event_inj_err),
                      error_code);
         }
-        stl_phys(env->vm_vmcb + offsetof(struct vmcb, control.event_inj),
+        stl_phys(cs->as,
+                 env->vm_vmcb + offsetof(struct vmcb, control.event_inj),
                  event_inj);
     }
 }
@@ -1160,9 +1166,11 @@ static void handle_even_inj(CPUX86State *env, int intno, int is_int,
  * the int instruction. next_eip is the env->eip value AFTER the interrupt
  * instruction. It is only relevant if is_int is TRUE.
  */
-static void do_interrupt_all(CPUX86State *env, int intno, int is_int,
+static void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
                              int error_code, target_ulong next_eip, int is_hw)
 {
+    CPUX86State *env = &cpu->env;
+
     if (qemu_loglevel_mask(CPU_LOG_INT)) {
         if ((env->cr[0] & CR0_PE_MASK)) {
             static int count;
@@ -1180,7 +1188,7 @@ static void do_interrupt_all(CPUX86State *env, int intno, int is_int,
                 qemu_log(" env->regs[R_EAX]=" TARGET_FMT_lx, env->regs[R_EAX]);
             }
             qemu_log("\n");
-            log_cpu_state(env, CPU_DUMP_CCOP);
+            log_cpu_state(CPU(cpu), CPU_DUMP_CCOP);
 #if 0
             {
                 int i;
@@ -1223,11 +1231,13 @@ static void do_interrupt_all(CPUX86State *env, int intno, int is_int,
 
 #if !defined(CONFIG_USER_ONLY)
     if (env->hflags & HF_SVMI_MASK) {
-        uint32_t event_inj = ldl_phys(env->vm_vmcb +
+        CPUState *cs = CPU(cpu);
+        uint32_t event_inj = ldl_phys(cs->as, env->vm_vmcb +
                                       offsetof(struct vmcb,
                                                control.event_inj));
 
-        stl_phys(env->vm_vmcb + offsetof(struct vmcb, control.event_inj),
+        stl_phys(cs->as,
+                 env->vm_vmcb + offsetof(struct vmcb, control.event_inj),
                  event_inj & ~SVM_EVTINJ_VALID);
     }
 #endif
@@ -1242,7 +1252,7 @@ void x86_cpu_do_interrupt(CPUState *cs)
     /* if user mode only, we simulate a fake exception
        which will be handled outside the cpu execution
        loop */
-    do_interrupt_user(env, env->exception_index,
+    do_interrupt_user(env, cs->exception_index,
                       env->exception_is_int,
                       env->error_code,
                       env->exception_next_eip);
@@ -1252,7 +1262,7 @@ void x86_cpu_do_interrupt(CPUState *cs)
     /* simulate a real cpu exception. On i386, it can
        trigger new exceptions, but we do not handle
        double or triple faults yet. */
-    do_interrupt_all(env, env->exception_index,
+    do_interrupt_all(cpu, cs->exception_index,
                      env->exception_is_int,
                      env->error_code,
                      env->exception_next_eip, 0);
@@ -1263,7 +1273,7 @@ void x86_cpu_do_interrupt(CPUState *cs)
 
 void do_interrupt_x86_hardirq(CPUX86State *env, int intno, int is_hw)
 {
-    do_interrupt_all(env, intno, 0, 0, 0, is_hw);
+    do_interrupt_all(x86_env_get_cpu(env), intno, 0, 0, 0, is_hw);
 }
 
 void helper_enter_level(CPUX86State *env, int level, int data32,
@@ -1684,7 +1694,7 @@ void helper_lcall_protected(CPUX86State *env, int new_cs, target_ulong new_eip,
 
     next_eip = env->eip + next_eip_addend;
     LOG_PCALL("lcall %04x:%08x s=%d\n", new_cs, (uint32_t)new_eip, shift);
-    LOG_PCALL_STATE(env);
+    LOG_PCALL_STATE(CPU(x86_env_get_cpu(env)));
     if ((new_cs & 0xfffc) == 0) {
         raise_exception_err(env, EXCP0D_GPF, 0);
     }
@@ -2018,7 +2028,7 @@ static inline void helper_ret_protected(CPUX86State *env, int shift,
     }
     LOG_PCALL("lret new %04x:" TARGET_FMT_lx " s=%d addend=0x%x\n",
               new_cs, new_eip, shift, addend);
-    LOG_PCALL_STATE(env);
+    LOG_PCALL_STATE(CPU(x86_env_get_cpu(env)));
     if ((new_cs & 0xfffc) == 0) {
         raise_exception_err(env, EXCP0D_GPF, new_cs & 0xfffc);
     }

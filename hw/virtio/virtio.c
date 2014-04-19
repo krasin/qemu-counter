@@ -14,13 +14,17 @@
 #include <inttypes.h>
 
 #include "trace.h"
+#include "exec/address-spaces.h"
 #include "qemu/error-report.h"
 #include "hw/virtio/virtio.h"
 #include "qemu/atomic.h"
 #include "hw/virtio/virtio-bus.h"
 
-/* The alignment to use between consumer and producer parts of vring.
- * x86 pagesize again. */
+/*
+ * The alignment to use between consumer and producer parts of vring.
+ * x86 pagesize again. This is the default, used by transports like PCI
+ * which don't provide a means for the guest to tell the host the alignment.
+ */
 #define VIRTIO_PCI_VRING_ALIGN         4096
 
 typedef struct VRingDesc
@@ -54,6 +58,7 @@ typedef struct VRingUsed
 typedef struct VRing
 {
     unsigned int num;
+    unsigned int align;
     hwaddr desc;
     hwaddr avail;
     hwaddr used;
@@ -93,56 +98,56 @@ static void virtqueue_init(VirtQueue *vq)
     vq->vring.avail = pa + vq->vring.num * sizeof(VRingDesc);
     vq->vring.used = vring_align(vq->vring.avail +
                                  offsetof(VRingAvail, ring[vq->vring.num]),
-                                 VIRTIO_PCI_VRING_ALIGN);
+                                 vq->vring.align);
 }
 
 static inline uint64_t vring_desc_addr(hwaddr desc_pa, int i)
 {
     hwaddr pa;
     pa = desc_pa + sizeof(VRingDesc) * i + offsetof(VRingDesc, addr);
-    return ldq_phys(pa);
+    return ldq_phys(&address_space_memory, pa);
 }
 
 static inline uint32_t vring_desc_len(hwaddr desc_pa, int i)
 {
     hwaddr pa;
     pa = desc_pa + sizeof(VRingDesc) * i + offsetof(VRingDesc, len);
-    return ldl_phys(pa);
+    return ldl_phys(&address_space_memory, pa);
 }
 
 static inline uint16_t vring_desc_flags(hwaddr desc_pa, int i)
 {
     hwaddr pa;
     pa = desc_pa + sizeof(VRingDesc) * i + offsetof(VRingDesc, flags);
-    return lduw_phys(pa);
+    return lduw_phys(&address_space_memory, pa);
 }
 
 static inline uint16_t vring_desc_next(hwaddr desc_pa, int i)
 {
     hwaddr pa;
     pa = desc_pa + sizeof(VRingDesc) * i + offsetof(VRingDesc, next);
-    return lduw_phys(pa);
+    return lduw_phys(&address_space_memory, pa);
 }
 
 static inline uint16_t vring_avail_flags(VirtQueue *vq)
 {
     hwaddr pa;
     pa = vq->vring.avail + offsetof(VRingAvail, flags);
-    return lduw_phys(pa);
+    return lduw_phys(&address_space_memory, pa);
 }
 
 static inline uint16_t vring_avail_idx(VirtQueue *vq)
 {
     hwaddr pa;
     pa = vq->vring.avail + offsetof(VRingAvail, idx);
-    return lduw_phys(pa);
+    return lduw_phys(&address_space_memory, pa);
 }
 
 static inline uint16_t vring_avail_ring(VirtQueue *vq, int i)
 {
     hwaddr pa;
     pa = vq->vring.avail + offsetof(VRingAvail, ring[i]);
-    return lduw_phys(pa);
+    return lduw_phys(&address_space_memory, pa);
 }
 
 static inline uint16_t vring_used_event(VirtQueue *vq)
@@ -154,42 +159,44 @@ static inline void vring_used_ring_id(VirtQueue *vq, int i, uint32_t val)
 {
     hwaddr pa;
     pa = vq->vring.used + offsetof(VRingUsed, ring[i].id);
-    stl_phys(pa, val);
+    stl_phys(&address_space_memory, pa, val);
 }
 
 static inline void vring_used_ring_len(VirtQueue *vq, int i, uint32_t val)
 {
     hwaddr pa;
     pa = vq->vring.used + offsetof(VRingUsed, ring[i].len);
-    stl_phys(pa, val);
+    stl_phys(&address_space_memory, pa, val);
 }
 
 static uint16_t vring_used_idx(VirtQueue *vq)
 {
     hwaddr pa;
     pa = vq->vring.used + offsetof(VRingUsed, idx);
-    return lduw_phys(pa);
+    return lduw_phys(&address_space_memory, pa);
 }
 
 static inline void vring_used_idx_set(VirtQueue *vq, uint16_t val)
 {
     hwaddr pa;
     pa = vq->vring.used + offsetof(VRingUsed, idx);
-    stw_phys(pa, val);
+    stw_phys(&address_space_memory, pa, val);
 }
 
 static inline void vring_used_flags_set_bit(VirtQueue *vq, int mask)
 {
     hwaddr pa;
     pa = vq->vring.used + offsetof(VRingUsed, flags);
-    stw_phys(pa, lduw_phys(pa) | mask);
+    stw_phys(&address_space_memory,
+             pa, lduw_phys(&address_space_memory, pa) | mask);
 }
 
 static inline void vring_used_flags_unset_bit(VirtQueue *vq, int mask)
 {
     hwaddr pa;
     pa = vq->vring.used + offsetof(VRingUsed, flags);
-    stw_phys(pa, lduw_phys(pa) & ~mask);
+    stw_phys(&address_space_memory,
+             pa, lduw_phys(&address_space_memory, pa) & ~mask);
 }
 
 static inline void vring_avail_event(VirtQueue *vq, uint16_t val)
@@ -199,7 +206,7 @@ static inline void vring_avail_event(VirtQueue *vq, uint16_t val)
         return;
     }
     pa = vq->vring.used + offsetof(VRingUsed, ring[vq->vring.num]);
-    stw_phys(pa, val);
+    stw_phys(&address_space_memory, pa, val);
 }
 
 void virtio_queue_set_notification(VirtQueue *vq, int enable)
@@ -373,8 +380,8 @@ void virtqueue_get_avail_bytes(VirtQueue *vq, unsigned int *in_bytes,
             /* loop over the indirect descriptor table */
             indirect = 1;
             max = vring_desc_len(desc_pa, i) / sizeof(VRingDesc);
-            num_bufs = i = 0;
             desc_pa = vring_desc_addr(desc_pa, i);
+            num_bufs = i = 0;
         }
 
         do {
@@ -667,6 +674,20 @@ hwaddr virtio_queue_get_addr(VirtIODevice *vdev, int n)
     return vdev->vq[n].pa;
 }
 
+void virtio_queue_set_num(VirtIODevice *vdev, int n, int num)
+{
+    /* Don't allow guest to flip queue between existent and
+     * nonexistent states, or to set it to an invalid size.
+     */
+    if (!!num != !!vdev->vq[n].vring.num ||
+        num > VIRTQUEUE_MAX_SIZE ||
+        num < 0) {
+        return;
+    }
+    vdev->vq[n].vring.num = num;
+    virtqueue_init(&vdev->vq[n]);
+}
+
 int virtio_queue_get_num(VirtIODevice *vdev, int n)
 {
     return vdev->vq[n].vring.num;
@@ -677,6 +698,21 @@ int virtio_queue_get_id(VirtQueue *vq)
     VirtIODevice *vdev = vq->vdev;
     assert(vq >= &vdev->vq[0] && vq < &vdev->vq[VIRTIO_PCI_QUEUE_MAX]);
     return vq - &vdev->vq[0];
+}
+
+void virtio_queue_set_align(VirtIODevice *vdev, int n, int align)
+{
+    BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
+    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
+
+    /* Check that the transport told us it was going to do this
+     * (so a buggy transport will immediately assert rather than
+     * silently failing to migrate this state)
+     */
+    assert(k->has_variable_vring_alignment);
+
+    vdev->vq[n].vring.align = align;
+    virtqueue_init(&vdev->vq[n]);
 }
 
 void virtio_queue_notify_vq(VirtQueue *vq)
@@ -719,6 +755,7 @@ VirtQueue *virtio_add_queue(VirtIODevice *vdev, int queue_size,
         abort();
 
     vdev->vq[i].vring.num = queue_size;
+    vdev->vq[i].vring.align = VIRTIO_PCI_VRING_ALIGN;
     vdev->vq[i].handle_output = handle_output;
 
     return &vdev->vq[i];
@@ -825,6 +862,9 @@ void virtio_save(VirtIODevice *vdev, QEMUFile *f)
             break;
 
         qemu_put_be32(f, vdev->vq[i].vring.num);
+        if (k->has_variable_vring_alignment) {
+            qemu_put_be32(f, vdev->vq[i].vring.align);
+        }
         qemu_put_be64(f, vdev->vq[i].pa);
         qemu_put_be16s(f, &vdev->vq[i].last_avail_idx);
         if (k->save_queue) {
@@ -881,6 +921,9 @@ int virtio_load(VirtIODevice *vdev, QEMUFile *f)
 
     for (i = 0; i < num; i++) {
         vdev->vq[i].vring.num = qemu_get_be32(f);
+        if (k->has_variable_vring_alignment) {
+            vdev->vq[i].vring.align = qemu_get_be32(f);
+        }
         vdev->vq[i].pa = qemu_get_be64(f);
         qemu_get_be16s(f, &vdev->vq[i].last_avail_idx);
         vdev->vq[i].signalled_used_valid = false;
@@ -1025,6 +1068,11 @@ void virtio_queue_set_last_avail_idx(VirtIODevice *vdev, int n, uint16_t idx)
     vdev->vq[n].last_avail_idx = idx;
 }
 
+void virtio_queue_invalidate_signalled_used(VirtIODevice *vdev, int n)
+{
+    vdev->vq[n].signalled_used_valid = false;
+}
+
 VirtQueue *virtio_get_queue(VirtIODevice *vdev, int n)
 {
     return vdev->vq + n;
@@ -1105,35 +1153,51 @@ void virtio_device_set_child_bus_name(VirtIODevice *vdev, char *bus_name)
     }
 }
 
-static int virtio_device_init(DeviceState *qdev)
+static void virtio_device_realize(DeviceState *dev, Error **errp)
 {
-    VirtIODevice *vdev = VIRTIO_DEVICE(qdev);
-    VirtioDeviceClass *k = VIRTIO_DEVICE_GET_CLASS(qdev);
-    assert(k->init != NULL);
-    if (k->init(vdev) < 0) {
-        return -1;
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtioDeviceClass *vdc = VIRTIO_DEVICE_GET_CLASS(dev);
+    Error *err = NULL;
+
+    if (vdc->realize != NULL) {
+        vdc->realize(dev, &err);
+        if (err != NULL) {
+            error_propagate(errp, err);
+            return;
+        }
     }
-    virtio_bus_plug_device(vdev);
-    return 0;
+    virtio_bus_device_plugged(vdev);
 }
 
-static int virtio_device_exit(DeviceState *qdev)
+static void virtio_device_unrealize(DeviceState *dev, Error **errp)
 {
-    VirtIODevice *vdev = VIRTIO_DEVICE(qdev);
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtioDeviceClass *vdc = VIRTIO_DEVICE_GET_CLASS(dev);
+    Error *err = NULL;
+
+    virtio_bus_device_unplugged(vdev);
+
+    if (vdc->unrealize != NULL) {
+        vdc->unrealize(dev, &err);
+        if (err != NULL) {
+            error_propagate(errp, err);
+            return;
+        }
+    }
 
     if (vdev->bus_name) {
         g_free(vdev->bus_name);
         vdev->bus_name = NULL;
     }
-    return 0;
 }
 
 static void virtio_device_class_init(ObjectClass *klass, void *data)
 {
     /* Set the default value here. */
     DeviceClass *dc = DEVICE_CLASS(klass);
-    dc->init = virtio_device_init;
-    dc->exit = virtio_device_exit;
+
+    dc->realize = virtio_device_realize;
+    dc->unrealize = virtio_device_unrealize;
     dc->bus_type = TYPE_VIRTIO_BUS;
 }
 

@@ -77,10 +77,12 @@ static void virtio_scsi_bad_req(void)
     exit(1);
 }
 
-static void qemu_sgl_init_external(QEMUSGList *qsgl, struct iovec *sg,
+static void qemu_sgl_init_external(VirtIOSCSIReq *req, struct iovec *sg,
                                    hwaddr *addr, int num)
 {
-    qemu_sglist_init(qsgl, num, &address_space_memory);
+    QEMUSGList *qsgl = &req->qsgl;
+
+    qemu_sglist_init(qsgl, DEVICE(req->dev), num, &address_space_memory);
     while (num--) {
         qemu_sglist_add(qsgl, *(addr++), (sg++)->iov_len);
     }
@@ -99,11 +101,11 @@ static void virtio_scsi_parse_req(VirtIOSCSI *s, VirtQueue *vq,
     req->resp.buf = req->elem.in_sg[0].iov_base;
 
     if (req->elem.out_num > 1) {
-        qemu_sgl_init_external(&req->qsgl, &req->elem.out_sg[1],
+        qemu_sgl_init_external(req, &req->elem.out_sg[1],
                                &req->elem.out_addr[1],
                                req->elem.out_num - 1);
     } else {
-        qemu_sgl_init_external(&req->qsgl, &req->elem.in_sg[1],
+        qemu_sgl_init_external(req, &req->elem.in_sg[1],
                                &req->elem.in_addr[1],
                                req->elem.in_num - 1);
     }
@@ -302,7 +304,13 @@ static void virtio_scsi_command_complete(SCSIRequest *r, uint32_t status,
                                          size_t resid)
 {
     VirtIOSCSIReq *req = r->hba_private;
+    VirtIOSCSI *s = req->dev;
+    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
     uint32_t sense_len;
+
+    if (r->io_canceled) {
+        return;
+    }
 
     req->resp.cmd->response = VIRTIO_SCSI_S_OK;
     req->resp.cmd->status = status;
@@ -311,7 +319,7 @@ static void virtio_scsi_command_complete(SCSIRequest *r, uint32_t status,
     } else {
         req->resp.cmd->resid = 0;
         sense_len = scsi_req_get_sense(r, req->resp.cmd->sense,
-                                       VIRTIO_SCSI_SENSE_SIZE);
+                                       vs->sense_size);
         req->resp.cmd->sense_len = tswap32(sense_len);
     }
     virtio_scsi_complete_req(req);
@@ -514,7 +522,7 @@ static void virtio_scsi_push_event(VirtIOSCSI *s, SCSIDevice *dev,
     evt->event = event;
     evt->reason = reason;
     if (!dev) {
-        assert(event == VIRTIO_SCSI_T_NO_EVENT);
+        assert(event == VIRTIO_SCSI_T_EVENTS_MISSED);
     } else {
         evt->lun[0] = 1;
         evt->lun[1] = dev->id;
@@ -587,12 +595,13 @@ static struct SCSIBusInfo virtio_scsi_scsi_info = {
     .load_request = virtio_scsi_load_request,
 };
 
-int virtio_scsi_common_init(VirtIOSCSICommon *s)
+void virtio_scsi_common_realize(DeviceState *dev, Error **errp)
 {
-    VirtIODevice *vdev = VIRTIO_DEVICE(s);
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtIOSCSICommon *s = VIRTIO_SCSI_COMMON(dev);
     int i;
 
-    virtio_init(VIRTIO_DEVICE(s), "virtio-scsi", VIRTIO_ID_SCSI,
+    virtio_init(vdev, "virtio-scsi", VIRTIO_ID_SCSI,
                 sizeof(VirtIOSCSIConfig));
 
     s->cmd_vqs = g_malloc0(s->conf.num_queues * sizeof(VirtQueue *));
@@ -607,51 +616,52 @@ int virtio_scsi_common_init(VirtIOSCSICommon *s)
         s->cmd_vqs[i] = virtio_add_queue(vdev, VIRTIO_SCSI_VQ_SIZE,
                                          virtio_scsi_handle_cmd);
     }
-
-    return 0;
 }
 
-static int virtio_scsi_device_init(VirtIODevice *vdev)
+static void virtio_scsi_device_realize(DeviceState *dev, Error **errp)
 {
-    DeviceState *qdev = DEVICE(vdev);
-    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(vdev);
-    VirtIOSCSI *s = VIRTIO_SCSI(vdev);
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtIOSCSI *s = VIRTIO_SCSI(dev);
     static int virtio_scsi_id;
-    int ret;
+    Error *err = NULL;
 
-    ret = virtio_scsi_common_init(vs);
-    if (ret < 0) {
-        return ret;
+    virtio_scsi_common_realize(dev, &err);
+    if (err != NULL) {
+        error_propagate(errp, err);
+        return;
     }
 
-    scsi_bus_new(&s->bus, qdev, &virtio_scsi_scsi_info, vdev->bus_name);
+    scsi_bus_new(&s->bus, sizeof(s->bus), dev,
+                 &virtio_scsi_scsi_info, vdev->bus_name);
 
-    if (!qdev->hotplugged) {
-        scsi_bus_legacy_handle_cmdline(&s->bus);
+    if (!dev->hotplugged) {
+        scsi_bus_legacy_handle_cmdline(&s->bus, &err);
+        if (err != NULL) {
+            error_propagate(errp, err);
+            return;
+        }
     }
 
-    register_savevm(qdev, "virtio-scsi", virtio_scsi_id++, 1,
+    register_savevm(dev, "virtio-scsi", virtio_scsi_id++, 1,
                     virtio_scsi_save, virtio_scsi_load, s);
-
-    return 0;
 }
 
-int virtio_scsi_common_exit(VirtIOSCSICommon *vs)
+void virtio_scsi_common_unrealize(DeviceState *dev, Error **errp)
 {
-    VirtIODevice *vdev = VIRTIO_DEVICE(vs);
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(dev);
 
     g_free(vs->cmd_vqs);
     virtio_cleanup(vdev);
-    return 0;
 }
 
-static int virtio_scsi_device_exit(DeviceState *qdev)
+static void virtio_scsi_device_unrealize(DeviceState *dev, Error **errp)
 {
-    VirtIOSCSI *s = VIRTIO_SCSI(qdev);
-    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(qdev);
+    VirtIOSCSI *s = VIRTIO_SCSI(dev);
 
-    unregister_savevm(qdev, "virtio-scsi", s);
-    return virtio_scsi_common_exit(vs);
+    unregister_savevm(dev, "virtio-scsi", s);
+
+    virtio_scsi_common_unrealize(dev, errp);
 }
 
 static Property virtio_scsi_properties[] = {
@@ -662,17 +672,21 @@ static Property virtio_scsi_properties[] = {
 static void virtio_scsi_common_class_init(ObjectClass *klass, void *data)
 {
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
     vdc->get_config = virtio_scsi_get_config;
+    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }
 
 static void virtio_scsi_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
-    dc->exit = virtio_scsi_device_exit;
+
     dc->props = virtio_scsi_properties;
-    vdc->init = virtio_scsi_device_init;
+    set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
+    vdc->realize = virtio_scsi_device_realize;
+    vdc->unrealize = virtio_scsi_device_unrealize;
     vdc->set_config = virtio_scsi_set_config;
     vdc->get_features = virtio_scsi_get_features;
     vdc->reset = virtio_scsi_reset;
@@ -682,6 +696,7 @@ static const TypeInfo virtio_scsi_common_info = {
     .name = TYPE_VIRTIO_SCSI_COMMON,
     .parent = TYPE_VIRTIO_DEVICE,
     .instance_size = sizeof(VirtIOSCSICommon),
+    .abstract = true,
     .class_init = virtio_scsi_common_class_init,
 };
 

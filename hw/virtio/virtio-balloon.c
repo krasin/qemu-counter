@@ -53,8 +53,8 @@ static const char *balloon_stat_names[] = {
 /*
  * reset_stats - Mark all items in the stats array as unset
  *
- * This function needs to be called at device intialization and before
- * before updating to a set of newly-generated stats.  This will ensure that no
+ * This function needs to be called at device initialization and before
+ * updating to a set of newly-generated stats.  This will ensure that no
  * stale values stick around in case the guest reports a subset of the supported
  * statistics.
  */
@@ -78,8 +78,8 @@ static bool balloon_stats_enabled(const VirtIOBalloon *s)
 static void balloon_stats_destroy_timer(VirtIOBalloon *s)
 {
     if (balloon_stats_enabled(s)) {
-        qemu_del_timer(s->stats_timer);
-        qemu_free_timer(s->stats_timer);
+        timer_del(s->stats_timer);
+        timer_free(s->stats_timer);
         s->stats_timer = NULL;
         s->stats_poll_interval = 0;
     }
@@ -87,7 +87,7 @@ static void balloon_stats_destroy_timer(VirtIOBalloon *s)
 
 static void balloon_stats_change_timer(VirtIOBalloon *s, int secs)
 {
-    qemu_mod_timer(s->stats_timer, qemu_get_clock_ms(vm_clock) + secs * 1000);
+    timer_mod(s->stats_timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL) + secs * 1000);
 }
 
 static void balloon_stats_poll_cb(void *opaque)
@@ -173,7 +173,7 @@ static void balloon_stats_set_poll_interval(Object *obj, struct Visitor *v,
 
     /* create a new timer */
     g_assert(s->stats_timer == NULL);
-    s->stats_timer = qemu_new_timer_ms(vm_clock, balloon_stats_poll_cb, s);
+    s->stats_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, balloon_stats_poll_cb, s);
     s->stats_poll_interval = value;
     balloon_stats_change_timer(s, 0);
 }
@@ -205,6 +205,7 @@ static void virtio_balloon_handle_output(VirtIODevice *vdev, VirtQueue *vq)
             addr = section.offset_within_region;
             balloon_page(memory_region_get_ram_ptr(section.mr) + addr,
                          !!(vq == s->dvq));
+            memory_region_unref(section.mr);
         }
 
         virtqueue_push(vq, &elem, offset);
@@ -262,7 +263,7 @@ static void virtio_balloon_get_config(VirtIODevice *vdev, uint8_t *config_data)
     config.num_pages = cpu_to_le32(dev->num_pages);
     config.actual = cpu_to_le32(dev->actual);
 
-    memcpy(config_data, &config, 8);
+    memcpy(config_data, &config, sizeof(struct virtio_balloon_config));
 }
 
 static void virtio_balloon_set_config(VirtIODevice *vdev,
@@ -271,7 +272,7 @@ static void virtio_balloon_set_config(VirtIODevice *vdev,
     VirtIOBalloon *dev = VIRTIO_BALLOON(vdev);
     struct virtio_balloon_config config;
     uint32_t oldactual = dev->actual;
-    memcpy(&config, config_data, 8);
+    memcpy(&config, config_data, sizeof(struct virtio_balloon_config));
     dev->actual = le32_to_cpu(config.actual);
     if (dev->actual != oldactual) {
         qemu_balloon_changed(ram_size -
@@ -336,49 +337,49 @@ static int virtio_balloon_load(QEMUFile *f, void *opaque, int version_id)
     return 0;
 }
 
-static int virtio_balloon_device_init(VirtIODevice *vdev)
+static void virtio_balloon_device_realize(DeviceState *dev, Error **errp)
 {
-    DeviceState *qdev = DEVICE(vdev);
-    VirtIOBalloon *s = VIRTIO_BALLOON(vdev);
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtIOBalloon *s = VIRTIO_BALLOON(dev);
     int ret;
 
-    virtio_init(vdev, "virtio-balloon", VIRTIO_ID_BALLOON, 8);
+    virtio_init(vdev, "virtio-balloon", VIRTIO_ID_BALLOON,
+                sizeof(struct virtio_balloon_config));
 
     ret = qemu_add_balloon_handler(virtio_balloon_to_target,
                                    virtio_balloon_stat, s);
 
     if (ret < 0) {
-        virtio_cleanup(VIRTIO_DEVICE(s));
-        return -1;
+        error_setg(errp, "Adding balloon handler failed");
+        virtio_cleanup(vdev);
+        return;
     }
 
     s->ivq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
     s->dvq = virtio_add_queue(vdev, 128, virtio_balloon_handle_output);
     s->svq = virtio_add_queue(vdev, 128, virtio_balloon_receive_stats);
 
-    register_savevm(qdev, "virtio-balloon", -1, 1,
+    register_savevm(dev, "virtio-balloon", -1, 1,
                     virtio_balloon_save, virtio_balloon_load, s);
 
-    object_property_add(OBJECT(qdev), "guest-stats", "guest statistics",
+    object_property_add(OBJECT(dev), "guest-stats", "guest statistics",
                         balloon_stats_get_all, NULL, NULL, s, NULL);
 
-    object_property_add(OBJECT(qdev), "guest-stats-polling-interval", "int",
+    object_property_add(OBJECT(dev), "guest-stats-polling-interval", "int",
                         balloon_stats_get_poll_interval,
                         balloon_stats_set_poll_interval,
                         NULL, s, NULL);
-    return 0;
 }
 
-static int virtio_balloon_device_exit(DeviceState *qdev)
+static void virtio_balloon_device_unrealize(DeviceState *dev, Error **errp)
 {
-    VirtIOBalloon *s = VIRTIO_BALLOON(qdev);
-    VirtIODevice *vdev = VIRTIO_DEVICE(qdev);
+    VirtIODevice *vdev = VIRTIO_DEVICE(dev);
+    VirtIOBalloon *s = VIRTIO_BALLOON(dev);
 
     balloon_stats_destroy_timer(s);
     qemu_remove_balloon_handler(s);
-    unregister_savevm(qdev, "virtio-balloon", s);
+    unregister_savevm(dev, "virtio-balloon", s);
     virtio_cleanup(vdev);
-    return 0;
 }
 
 static Property virtio_balloon_properties[] = {
@@ -389,9 +390,11 @@ static void virtio_balloon_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
-    dc->exit = virtio_balloon_device_exit;
+
     dc->props = virtio_balloon_properties;
-    vdc->init = virtio_balloon_device_init;
+    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+    vdc->realize = virtio_balloon_device_realize;
+    vdc->unrealize = virtio_balloon_device_unrealize;
     vdc->get_config = virtio_balloon_get_config;
     vdc->set_config = virtio_balloon_set_config;
     vdc->get_features = virtio_balloon_get_features;

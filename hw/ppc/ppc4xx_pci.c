@@ -355,12 +355,12 @@ static int ppc4xx_pcihost_initfn(SysBusDevice *dev)
     pci_create_simple(b, 0, "ppc4xx-host-bridge");
 
     /* XXX split into 2 memory regions, one for config space, one for regs */
-    memory_region_init(&s->container, "pci-container", PCI_ALL_SIZE);
-    memory_region_init_io(&h->conf_mem, &pci_host_conf_le_ops, h,
+    memory_region_init(&s->container, OBJECT(s), "pci-container", PCI_ALL_SIZE);
+    memory_region_init_io(&h->conf_mem, OBJECT(s), &pci_host_conf_le_ops, h,
                           "pci-conf-idx", 4);
-    memory_region_init_io(&h->data_mem, &pci_host_data_le_ops, h,
+    memory_region_init_io(&h->data_mem, OBJECT(s), &pci_host_data_le_ops, h,
                           "pci-conf-data", 4);
-    memory_region_init_io(&s->iomem, &pci_reg_ops, s,
+    memory_region_init_io(&s->iomem, OBJECT(s), &pci_reg_ops, s,
                           "pci.reg", PCI_REG_SIZE);
     memory_region_add_subregion(&s->container, PCIC0_CFGADDR, &h->conf_mem);
     memory_region_add_subregion(&s->container, PCIC0_CFGDATA, &h->data_mem);
@@ -380,6 +380,11 @@ static void ppc4xx_host_bridge_class_init(ObjectClass *klass, void *data)
     k->vendor_id    = PCI_VENDOR_ID_IBM;
     k->device_id    = PCI_DEVICE_ID_IBM_440GX;
     k->class_id     = PCI_CLASS_BRIDGE_OTHER;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo ppc4xx_host_bridge_info = {

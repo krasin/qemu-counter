@@ -352,7 +352,7 @@ static void pc87312_initfn(Object *obj)
 {
     PC87312State *s = PC87312(obj);
 
-    memory_region_init_io(&s->io, &pc87312_io_ops, s, "pc87312", 2);
+    memory_region_init_io(&s->io, obj, &pc87312_io_ops, s, "pc87312", 2);
 }
 
 static const VMStateDescription vmstate_pc87312 = {
@@ -369,7 +369,7 @@ static const VMStateDescription vmstate_pc87312 = {
 };
 
 static Property pc87312_properties[] = {
-    DEFINE_PROP_HEX32("iobase", PC87312State, iobase, 0x398),
+    DEFINE_PROP_UINT32("iobase", PC87312State, iobase, 0x398),
     DEFINE_PROP_UINT8("config", PC87312State, config, 1),
     DEFINE_PROP_END_OF_LIST()
 };

@@ -42,9 +42,11 @@
 extern bool kvm_allowed;
 extern bool kvm_kernel_irqchip;
 extern bool kvm_async_interrupts_allowed;
+extern bool kvm_halt_in_kernel_allowed;
 extern bool kvm_irqfds_allowed;
 extern bool kvm_msi_via_irqfd_allowed;
 extern bool kvm_gsi_routing_allowed;
+extern bool kvm_gsi_direct_mapping;
 extern bool kvm_readonly_mem_allowed;
 
 #if defined CONFIG_KVM || !defined NEED_CPU_H
@@ -73,6 +75,14 @@ extern bool kvm_readonly_mem_allowed;
 #define kvm_async_interrupts_enabled() (kvm_async_interrupts_allowed)
 
 /**
+ * kvm_halt_in_kernel
+ *
+ * Returns: true if halted cpus should still get a KVM_RUN ioctl to run
+ * inside of kernel space. This only works if MP state is implemented.
+ */
+#define kvm_halt_in_kernel() (kvm_halt_in_kernel_allowed)
+
+/**
  * kvm_irqfds_enabled:
  *
  * Returns: true if we can use irqfds to inject interrupts into
@@ -99,6 +109,13 @@ extern bool kvm_readonly_mem_allowed;
 #define kvm_gsi_routing_enabled() (kvm_gsi_routing_allowed)
 
 /**
+ * kvm_gsi_direct_mapping:
+ *
+ * Returns: true if GSI direct mapping is enabled.
+ */
+#define kvm_gsi_direct_mapping() (kvm_gsi_direct_mapping)
+
+/**
  * kvm_readonly_mem_enabled:
  *
  * Returns: true if KVM readonly memory is enabled (ie the kernel
@@ -110,9 +127,11 @@ extern bool kvm_readonly_mem_allowed;
 #define kvm_enabled()           (0)
 #define kvm_irqchip_in_kernel() (false)
 #define kvm_async_interrupts_enabled() (false)
+#define kvm_halt_in_kernel() (false)
 #define kvm_irqfds_enabled() (false)
 #define kvm_msi_via_irqfd_enabled() (false)
 #define kvm_gsi_routing_allowed() (false)
+#define kvm_gsi_direct_mapping() (false)
 #define kvm_readonly_mem_enabled() (false)
 #endif
 
@@ -133,7 +152,7 @@ extern KVMState *kvm_state;
 
 /* external API */
 
-int kvm_init(void);
+int kvm_init(QEMUMachine *machine);
 
 int kvm_has_sync_mmu(void);
 int kvm_has_vcpu_events(void);
@@ -151,20 +170,15 @@ int kvm_cpu_exec(CPUState *cpu);
 
 #ifdef NEED_CPU_H
 
-#if !defined(CONFIG_USER_ONLY)
-void *kvm_ram_alloc(ram_addr_t size);
-void *kvm_arch_ram_alloc(ram_addr_t size);
-#endif
-
 void kvm_setup_guest_memory(void *start, size_t size);
 void kvm_flush_coalesced_mmio_buffer(void);
 
-int kvm_insert_breakpoint(CPUArchState *current_env, target_ulong addr,
+int kvm_insert_breakpoint(CPUState *cpu, target_ulong addr,
                           target_ulong len, int type);
-int kvm_remove_breakpoint(CPUArchState *current_env, target_ulong addr,
+int kvm_remove_breakpoint(CPUState *cpu, target_ulong addr,
                           target_ulong len, int type);
-void kvm_remove_all_breakpoints(CPUArchState *current_env);
-int kvm_update_guest_debug(CPUArchState *env, unsigned long reinject_trap);
+void kvm_remove_all_breakpoints(CPUState *cpu);
+int kvm_update_guest_debug(CPUState *cpu, unsigned long reinject_trap);
 #ifndef _WIN32
 int kvm_set_signal_mask(CPUState *cpu, const sigset_t *sigset);
 #endif
@@ -179,6 +193,28 @@ int kvm_ioctl(KVMState *s, int type, ...);
 int kvm_vm_ioctl(KVMState *s, int type, ...);
 
 int kvm_vcpu_ioctl(CPUState *cpu, int type, ...);
+
+/**
+ * kvm_device_ioctl - call an ioctl on a kvm device
+ * @fd: The KVM device file descriptor as returned from KVM_CREATE_DEVICE
+ * @type: The device-ctrl ioctl number
+ *
+ * Returns: -errno on error, nonnegative on success
+ */
+int kvm_device_ioctl(int fd, int type, ...);
+
+/**
+ * kvm_create_device - create a KVM device for the device control API
+ * @KVMState: The KVMState pointer
+ * @type: The KVM device type (see Documentation/virtual/kvm/devices in the
+ *        kernel source)
+ * @test: If true, only test if device can be created, but don't actually
+ *        create the device.
+ *
+ * Returns: -errno on error, nonnegative on success: @test ? 0 : device fd;
+ */
+int kvm_create_device(KVMState *s, uint64_t type, bool test);
+
 
 /* Arch specific hooks */
 
@@ -220,6 +256,7 @@ int kvm_set_irq(KVMState *s, int irq, int level);
 int kvm_irqchip_send_msi(KVMState *s, MSIMessage msg);
 
 void kvm_irqchip_add_irq_route(KVMState *s, int gsi, int irqchip, int pin);
+void kvm_irqchip_commit_routes(KVMState *s);
 
 void kvm_put_apic_state(DeviceState *d, struct kvm_lapic_state *kapic);
 void kvm_get_apic_state(DeviceState *d, struct kvm_lapic_state *kapic);
@@ -241,9 +278,9 @@ struct kvm_sw_breakpoint *kvm_find_sw_breakpoint(CPUState *cpu,
 
 int kvm_sw_breakpoints_active(CPUState *cpu);
 
-int kvm_arch_insert_sw_breakpoint(CPUState *current_cpu,
+int kvm_arch_insert_sw_breakpoint(CPUState *cpu,
                                   struct kvm_sw_breakpoint *bp);
-int kvm_arch_remove_sw_breakpoint(CPUState *current_cpu,
+int kvm_arch_remove_sw_breakpoint(CPUState *cpu,
                                   struct kvm_sw_breakpoint *bp);
 int kvm_arch_insert_hw_breakpoint(target_ulong addr,
                                   target_ulong len, int type);
@@ -259,7 +296,17 @@ int kvm_check_extension(KVMState *s, unsigned int extension);
 
 uint32_t kvm_arch_get_supported_cpuid(KVMState *env, uint32_t function,
                                       uint32_t index, int reg);
+
+#if !defined(CONFIG_USER_ONLY)
+int kvm_physical_memory_addr_from_host(KVMState *s, void *ram_addr,
+                                       hwaddr *phys_addr);
+#endif
+
+#endif /* NEED_CPU_H */
+
 void kvm_cpu_synchronize_state(CPUState *cpu);
+void kvm_cpu_synchronize_post_reset(CPUState *cpu);
+void kvm_cpu_synchronize_post_init(CPUState *cpu);
 
 /* generic hooks - to be moved/refactored once there are more users */
 
@@ -269,16 +316,6 @@ static inline void cpu_synchronize_state(CPUState *cpu)
         kvm_cpu_synchronize_state(cpu);
     }
 }
-
-#if !defined(CONFIG_USER_ONLY)
-int kvm_physical_memory_addr_from_host(KVMState *s, void *ram_addr,
-                                       hwaddr *phys_addr);
-#endif
-
-#endif /* NEED_CPU_H */
-
-void kvm_cpu_synchronize_post_reset(CPUState *cpu);
-void kvm_cpu_synchronize_post_init(CPUState *cpu);
 
 static inline void cpu_synchronize_post_reset(CPUState *cpu)
 {
@@ -298,8 +335,22 @@ int kvm_irqchip_add_msi_route(KVMState *s, MSIMessage msg);
 int kvm_irqchip_update_msi_route(KVMState *s, int virq, MSIMessage msg);
 void kvm_irqchip_release_virq(KVMState *s, int virq);
 
-int kvm_irqchip_add_irqfd_notifier(KVMState *s, EventNotifier *n, int virq);
+int kvm_irqchip_add_irqfd_notifier(KVMState *s, EventNotifier *n,
+                                   EventNotifier *rn, int virq);
 int kvm_irqchip_remove_irqfd_notifier(KVMState *s, EventNotifier *n, int virq);
 void kvm_pc_gsi_handler(void *opaque, int n, int level);
 void kvm_pc_setup_irq_routing(bool pci_enabled);
+void kvm_init_irq_routing(KVMState *s);
+
+/**
+ * kvm_arch_irqchip_create:
+ * @KVMState: The KVMState pointer
+ *
+ * Allow architectures to create an in-kernel irq chip themselves.
+ *
+ * Returns: < 0: error
+ *            0: irq chip was not created
+ *          > 0: irq chip was created
+ */
+int kvm_arch_irqchip_create(KVMState *s);
 #endif

@@ -74,7 +74,7 @@ static TCGv env_pc;
 
 /* This is the state at translation time.  */
 typedef struct DisasContext {
-    CPUCRISState *env;
+    CRISCPU *cpu;
     target_ulong pc, ppc;
 
     /* Decoder.  */
@@ -129,7 +129,7 @@ static void gen_BUG(DisasContext *dc, const char *file, int line)
 {
     printf("BUG: pc=%x %s %d\n", dc->pc, file, line);
     qemu_log("BUG: pc=%x %s %d\n", dc->pc, file, line);
-    cpu_abort(dc->env, "%s:%d\n", file, line);
+    cpu_abort(CPU(dc->cpu), "%s:%d\n", file, line);
 }
 
 static const char *regnames[] =
@@ -272,7 +272,7 @@ static int cris_fetch(CPUCRISState *env, DisasContext *dc, uint32_t addr,
         break;
     }
     default:
-        cpu_abort(dc->env, "Invalid fetch size %d\n", size);
+        cpu_abort(CPU(dc->cpu), "Invalid fetch size %d\n", size);
         break;
     }
     return r;
@@ -558,7 +558,7 @@ static void gen_goto_tb(DisasContext *dc, int n, target_ulong dest)
     if ((tb->pc & TARGET_PAGE_MASK) == (dest & TARGET_PAGE_MASK)) {
         tcg_gen_goto_tb(n);
         tcg_gen_movi_tl(env_pc, dest);
-                tcg_gen_exit_tb((tcg_target_long)tb + n);
+                tcg_gen_exit_tb((uintptr_t)tb + n);
     } else {
         tcg_gen_movi_tl(env_pc, dest);
         tcg_gen_exit_tb(0);
@@ -1125,7 +1125,7 @@ static inline void cris_prepare_jmp (DisasContext *dc, unsigned int type)
 
 static void gen_load64(DisasContext *dc, TCGv_i64 dst, TCGv addr)
 {
-    int mem_index = cpu_mmu_index(dc->env);
+    int mem_index = cpu_mmu_index(&dc->cpu->env);
 
     /* If we get a fault on a delayslot we must keep the jmp state in
        the cpu-state to be able to re-execute the jmp.  */
@@ -1133,13 +1133,13 @@ static void gen_load64(DisasContext *dc, TCGv_i64 dst, TCGv addr)
         cris_store_direct_jmp(dc);
     }
 
-    tcg_gen_qemu_ld64(dst, addr, mem_index);
+    tcg_gen_qemu_ld_i64(dst, addr, mem_index, MO_TEQ);
 }
 
 static void gen_load(DisasContext *dc, TCGv dst, TCGv addr, 
              unsigned int size, int sign)
 {
-    int mem_index = cpu_mmu_index(dc->env);
+    int mem_index = cpu_mmu_index(&dc->cpu->env);
 
     /* If we get a fault on a delayslot we must keep the jmp state in
        the cpu-state to be able to re-execute the jmp.  */
@@ -1147,29 +1147,14 @@ static void gen_load(DisasContext *dc, TCGv dst, TCGv addr,
         cris_store_direct_jmp(dc);
     }
 
-    if (size == 1) {
-        if (sign) {
-            tcg_gen_qemu_ld8s(dst, addr, mem_index);
-        } else {
-            tcg_gen_qemu_ld8u(dst, addr, mem_index);
-        }
-    } else if (size == 2) {
-        if (sign) {
-            tcg_gen_qemu_ld16s(dst, addr, mem_index);
-        } else {
-            tcg_gen_qemu_ld16u(dst, addr, mem_index);
-        }
-    } else if (size == 4) {
-        tcg_gen_qemu_ld32u(dst, addr, mem_index);
-    } else {
-        abort();
-    }
+    tcg_gen_qemu_ld_tl(dst, addr, mem_index,
+                       MO_TE + ctz32(size) + (sign ? MO_SIGN : 0));
 }
 
 static void gen_store (DisasContext *dc, TCGv addr, TCGv val,
                unsigned int size)
 {
-    int mem_index = cpu_mmu_index(dc->env);
+    int mem_index = cpu_mmu_index(&dc->cpu->env);
 
     /* If we get a fault on a delayslot we must keep the jmp state in
        the cpu-state to be able to re-execute the jmp.  */
@@ -1187,13 +1172,7 @@ static void gen_store (DisasContext *dc, TCGv addr, TCGv val,
         return;
     }
 
-    if (size == 1) {
-        tcg_gen_qemu_st8(val, addr, mem_index);
-    } else if (size == 2) {
-        tcg_gen_qemu_st16(val, addr, mem_index);
-    } else {
-        tcg_gen_qemu_st32(val, addr, mem_index);
-    }
+    tcg_gen_qemu_st_tl(val, addr, mem_index, MO_TE + ctz32(size));
 
     if (dc->flagx_known && dc->flags_x) {
         cris_evaluate_flags(dc);
@@ -3110,10 +3089,11 @@ static unsigned int crisv32_decoder(CPUCRISState *env, DisasContext *dc)
 
 static void check_breakpoint(CPUCRISState *env, DisasContext *dc)
 {
+    CPUState *cs = CPU(cris_env_get_cpu(env));
     CPUBreakpoint *bp;
 
-    if (unlikely(!QTAILQ_EMPTY(&env->breakpoints))) {
-        QTAILQ_FOREACH(bp, &env->breakpoints, entry) {
+    if (unlikely(!QTAILQ_EMPTY(&cs->breakpoints))) {
+        QTAILQ_FOREACH(bp, &cs->breakpoints, entry) {
             if (bp->pc == dc->pc) {
                 cris_evaluate_flags(dc);
                 tcg_gen_movi_tl(env_pc, dc->pc);
@@ -3161,10 +3141,12 @@ static void check_breakpoint(CPUCRISState *env, DisasContext *dc)
  */
 
 /* generate intermediate code for basic block 'tb'.  */
-static void
-gen_intermediate_code_internal(CPUCRISState *env, TranslationBlock *tb,
-                               int search_pc)
+static inline void
+gen_intermediate_code_internal(CRISCPU *cpu, TranslationBlock *tb,
+                               bool search_pc)
 {
+    CPUState *cs = CPU(cpu);
+    CPUCRISState *env = &cpu->env;
     uint16_t *gen_opc_end;
     uint32_t pc_start;
     unsigned int insn_len;
@@ -3188,7 +3170,7 @@ gen_intermediate_code_internal(CPUCRISState *env, TranslationBlock *tb,
      * delayslot, like in real hw.
      */
     pc_start = tb->pc & ~1;
-    dc->env = env;
+    dc->cpu = cpu;
     dc->tb = tb;
 
     gen_opc_end = tcg_ctx.gen_opc_buf + OPC_MAX_SIZE;
@@ -3196,7 +3178,7 @@ gen_intermediate_code_internal(CPUCRISState *env, TranslationBlock *tb,
     dc->is_jmp = DISAS_NEXT;
     dc->ppc = pc_start;
     dc->pc = pc_start;
-    dc->singlestep_enabled = env->singlestep_enabled;
+    dc->singlestep_enabled = cs->singlestep_enabled;
     dc->flags_uptodate = 1;
     dc->flagx_known = 1;
     dc->flags_x = tb->flags & X_FLAG;
@@ -3336,7 +3318,7 @@ gen_intermediate_code_internal(CPUCRISState *env, TranslationBlock *tb,
 
         /* If we are rexecuting a branch due to exceptions on
            delay slots dont break.  */
-        if (!(tb->pc & 1) && env->singlestep_enabled) {
+        if (!(tb->pc & 1) && cs->singlestep_enabled) {
             break;
         }
     } while (!dc->is_jmp && !dc->cpustate_changed
@@ -3369,7 +3351,7 @@ gen_intermediate_code_internal(CPUCRISState *env, TranslationBlock *tb,
 
     cris_evaluate_flags(dc);
 
-    if (unlikely(env->singlestep_enabled)) {
+    if (unlikely(cs->singlestep_enabled)) {
         if (dc->is_jmp == DISAS_NEXT) {
             tcg_gen_movi_tl(env_pc, npc);
         }
@@ -3409,7 +3391,7 @@ gen_intermediate_code_internal(CPUCRISState *env, TranslationBlock *tb,
 #if !DISAS_CRIS
     if (qemu_loglevel_mask(CPU_LOG_TB_IN_ASM)) {
         log_target_disas(env, pc_start, dc->pc - pc_start,
-                                 dc->env->pregs[PR_VR]);
+                         env->pregs[PR_VR]);
         qemu_log("\nisize=%d osize=%td\n",
             dc->pc - pc_start, tcg_ctx.gen_opc_ptr - tcg_ctx.gen_opc_buf);
     }
@@ -3419,12 +3401,12 @@ gen_intermediate_code_internal(CPUCRISState *env, TranslationBlock *tb,
 
 void gen_intermediate_code (CPUCRISState *env, struct TranslationBlock *tb)
 {
-    gen_intermediate_code_internal(env, tb, 0);
+    gen_intermediate_code_internal(cris_env_get_cpu(env), tb, false);
 }
 
 void gen_intermediate_code_pc (CPUCRISState *env, struct TranslationBlock *tb)
 {
-    gen_intermediate_code_internal(env, tb, 1);
+    gen_intermediate_code_internal(cris_env_get_cpu(env), tb, true);
 }
 
 void cris_cpu_dump_state(CPUState *cs, FILE *f, fprintf_function cpu_fprintf,
@@ -3477,9 +3459,6 @@ void cris_cpu_dump_state(CPUState *cs, FILE *f, fprintf_function cpu_fprintf,
 void cris_initialize_tcg(void)
 {
     int i;
-
-#define GEN_HELPER 2
-#include "helper.h"
 
     cpu_env = tcg_global_reg_new_ptr(TCG_AREG0, "env");
     cc_x = tcg_global_mem_new(TCG_AREG0,

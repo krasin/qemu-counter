@@ -31,6 +31,8 @@
 #define XILINX_LOCK_KEY 0x767b
 #define XILINX_UNLOCK_KEY 0xdf0d
 
+#define R_PSS_RST_CTRL_SOFT_RST 0x1
+
 typedef enum {
   ARM_PLL_CTRL,
   DDR_PLL_CTRL,
@@ -114,8 +116,12 @@ typedef enum {
   RESET_MAX
 } ResetValues;
 
-typedef struct {
-    SysBusDevice busdev;
+#define TYPE_ZYNQ_SLCR "xilinx,zynq_slcr"
+#define ZYNQ_SLCR(obj) OBJECT_CHECK(ZynqSLCRState, (obj), TYPE_ZYNQ_SLCR)
+
+typedef struct ZynqSLCRState {
+    SysBusDevice parent_obj;
+
     MemoryRegion iomem;
 
     union {
@@ -158,9 +164,8 @@ typedef struct {
 
 static void zynq_slcr_reset(DeviceState *d)
 {
+    ZynqSLCRState *s = ZYNQ_SLCR(d);
     int i;
-    ZynqSLCRState *s =
-            FROM_SYSBUS(ZynqSLCRState, SYS_BUS_DEVICE(d));
 
     DB_PRINT("RESET\n");
 
@@ -396,6 +401,9 @@ static void zynq_slcr_write(void *opaque, hwaddr offset,
                 goto bad_reg;
             }
             s->reset[(offset - 0x200) / 4] = val;
+            if (offset == 0x200 && (val & R_PSS_RST_CTRL_SOFT_RST)) {
+                qemu_system_reset_request();
+            }
             break;
         case 0x300:
             s->apu_ctrl = val;
@@ -492,9 +500,9 @@ static const MemoryRegionOps slcr_ops = {
 
 static int zynq_slcr_init(SysBusDevice *dev)
 {
-    ZynqSLCRState *s = FROM_SYSBUS(ZynqSLCRState, dev);
+    ZynqSLCRState *s = ZYNQ_SLCR(dev);
 
-    memory_region_init_io(&s->iomem, &slcr_ops, s, "slcr", 0x1000);
+    memory_region_init_io(&s->iomem, OBJECT(s), &slcr_ops, s, "slcr", 0x1000);
     sysbus_init_mmio(dev, &s->iomem);
 
     return 0;
@@ -523,7 +531,7 @@ static void zynq_slcr_class_init(ObjectClass *klass, void *data)
 
 static const TypeInfo zynq_slcr_info = {
     .class_init = zynq_slcr_class_init,
-    .name  = "xilinx,zynq_slcr",
+    .name  = TYPE_ZYNQ_SLCR,
     .parent = TYPE_SYS_BUS_DEVICE,
     .instance_size  = sizeof(ZynqSLCRState),
 };

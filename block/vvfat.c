@@ -266,8 +266,7 @@ typedef struct mbr_t {
 } QEMU_PACKED mbr_t;
 
 typedef struct direntry_t {
-    uint8_t name[8];
-    uint8_t extension[3];
+    uint8_t name[8 + 3];
     uint8_t attributes;
     uint8_t reserved[2];
     uint16_t ctime;
@@ -518,11 +517,9 @@ static inline uint8_t fat_chksum(const direntry_t* entry)
     uint8_t chksum=0;
     int i;
 
-    for(i=0;i<11;i++) {
-        unsigned char c;
-
-        c = (i < 8) ? entry->name[i] : entry->extension[i-8];
-        chksum=(((chksum&0xfe)>>1)|((chksum&0x01)?0x80:0)) + c;
+    for (i = 0; i < ARRAY_SIZE(entry->name); i++) {
+        chksum = (((chksum & 0xfe) >> 1) |
+                  ((chksum & 0x01) ? 0x80 : 0)) + entry->name[i];
     }
 
     return chksum;
@@ -617,7 +614,7 @@ static inline direntry_t* create_short_and_long_name(BDRVVVFATState* s,
 
     if(is_dot) {
 	entry=array_get_next(&(s->directory));
-	memset(entry->name,0x20,11);
+        memset(entry->name, 0x20, sizeof(entry->name));
 	memcpy(entry->name,filename,strlen(filename));
 	return entry;
     }
@@ -632,12 +629,14 @@ static inline direntry_t* create_short_and_long_name(BDRVVVFATState* s,
 	i = 8;
 
     entry=array_get_next(&(s->directory));
-    memset(entry->name,0x20,11);
+    memset(entry->name, 0x20, sizeof(entry->name));
     memcpy(entry->name, filename, i);
 
-    if(j > 0)
-	for (i = 0; i < 3 && filename[j+1+i]; i++)
-	    entry->extension[i] = filename[j+1+i];
+    if (j > 0) {
+        for (i = 0; i < 3 && filename[j + 1 + i]; i++) {
+            entry->name[8 + i] = filename[j + 1 + i];
+        }
+    }
 
     /* upcase & remove unwanted characters */
     for(i=10;i>=0;i--) {
@@ -861,8 +860,7 @@ static int init_directories(BDRVVVFATState* s,
     {
 	direntry_t* entry=array_get_next(&(s->directory));
 	entry->attributes=0x28; /* archive | volume label */
-	memcpy(entry->name,"QEMU VVF",8);
-	memcpy(entry->extension,"AT ",3);
+        memcpy(entry->name, "QEMU VVFAT ", sizeof(entry->name));
     }
 
     /* Now build FAT, and write back information into directory */
@@ -1065,7 +1063,8 @@ static void vvfat_parse_filename(const char *filename, QDict *options,
     qdict_put(options, "rw", qbool_from_int(rw));
 }
 
-static int vvfat_open(BlockDriverState *bs, QDict *options, int flags)
+static int vvfat_open(BlockDriverState *bs, QDict *options, int flags,
+                      Error **errp)
 {
     BDRVVVFATState *s = bs->opaque;
     int cyls, heads, secs;
@@ -1084,19 +1083,17 @@ DLOG(if (stderr == NULL) {
     setbuf(stderr, NULL);
 })
 
-    opts = qemu_opts_create_nofail(&runtime_opts);
+    opts = qemu_opts_create(&runtime_opts, NULL, 0, &error_abort);
     qemu_opts_absorb_qdict(opts, options, &local_err);
-    if (error_is_set(&local_err)) {
-        qerror_report_err(local_err);
-        error_free(local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
         ret = -EINVAL;
         goto fail;
     }
 
     dirname = qemu_opt_get(opts, "dir");
     if (!dirname) {
-        qerror_report(ERROR_CLASS_GENERIC_ERROR, "vvfat block driver requires "
-                      "a 'dir' option");
+        error_setg(errp, "vvfat block driver requires a 'dir' option");
         ret = -EINVAL;
         goto fail;
     }
@@ -1122,6 +1119,7 @@ DLOG(if (stderr == NULL) {
         if (!s->fat_type) {
             s->fat_type = 16;
         }
+        s->first_sectors_number = 0x40;
         cyls = s->fat_type == 12 ? 64 : 1024;
         heads = 16;
         secs = 63;
@@ -1136,8 +1134,7 @@ DLOG(if (stderr == NULL) {
     case 12:
         break;
     default:
-        qerror_report(ERROR_CLASS_GENERIC_ERROR, "Valid FAT types are only "
-                      "12, 16 and 32");
+        error_setg(errp, "Valid FAT types are only 12, 16 and 32");
         ret = -EINVAL;
         goto fail;
     }
@@ -1150,7 +1147,6 @@ DLOG(if (stderr == NULL) {
 
     s->current_cluster=0xffffffff;
 
-    s->first_sectors_number=0x40;
     /* read only is the default for safety */
     bs->read_only = 1;
     s->qcow = s->write_target = NULL;
@@ -1164,8 +1160,8 @@ DLOG(if (stderr == NULL) {
     s->sector_count = cyls * heads * secs - (s->first_sectors_number - 1);
 
     if (qemu_opt_get_bool(opts, "rw", false)) {
-        if (enable_write_target(s)) {
-            ret = -EIO;
+        ret = enable_write_target(s);
+        if (ret < 0) {
             goto fail;
         }
         bs->read_only = 0;
@@ -1590,17 +1586,20 @@ static int parse_short_name(BDRVVVFATState* s,
 	    lfn->name[i] = direntry->name[i];
     }
 
-    for (j = 2; j >= 0 && direntry->extension[j] == ' '; j--);
+    for (j = 2; j >= 0 && direntry->name[8 + j] == ' '; j--) {
+    }
     if (j >= 0) {
 	lfn->name[i++] = '.';
 	lfn->name[i + j + 1] = '\0';
 	for (;j >= 0; j--) {
-	    if (direntry->extension[j] <= ' ' || direntry->extension[j] > 0x7f)
-		return -2;
-	    else if (s->downcase_short_names)
-		lfn->name[i + j] = qemu_tolower(direntry->extension[j]);
-	    else
-		lfn->name[i + j] = direntry->extension[j];
+            uint8_t c = direntry->name[8 + j];
+            if (c <= ' ' || c > 0x7f) {
+                return -2;
+            } else if (s->downcase_short_names) {
+                lfn->name[i + j] = qemu_tolower(c);
+            } else {
+                lfn->name[i + j] = c;
+            }
 	}
     } else
 	lfn->name[i + j + 1] = '\0';
@@ -2874,16 +2873,17 @@ static coroutine_fn int vvfat_co_write(BlockDriverState *bs, int64_t sector_num,
     return ret;
 }
 
-static int coroutine_fn vvfat_co_is_allocated(BlockDriverState *bs,
+static int64_t coroutine_fn vvfat_co_get_block_status(BlockDriverState *bs,
 	int64_t sector_num, int nb_sectors, int* n)
 {
     BDRVVVFATState* s = bs->opaque;
     *n = s->sector_count - sector_num;
-    if (*n > nb_sectors)
-	*n = nb_sectors;
-    else if (*n < 0)
-	return 0;
-    return 1;
+    if (*n > nb_sectors) {
+        *n = nb_sectors;
+    } else if (*n < 0) {
+        return 0;
+    }
+    return BDRV_BLOCK_DATA;
 }
 
 static int write_target_commit(BlockDriverState *bs, int64_t sector_num,
@@ -2894,7 +2894,7 @@ static int write_target_commit(BlockDriverState *bs, int64_t sector_num,
 
 static void write_target_close(BlockDriverState *bs) {
     BDRVVVFATState* s = *((BDRVVVFATState**) bs->opaque);
-    bdrv_delete(s->qcow);
+    bdrv_unref(s->qcow);
     g_free(s->qcow_filename);
 }
 
@@ -2908,6 +2908,7 @@ static int enable_write_target(BDRVVVFATState *s)
 {
     BlockDriver *bdrv_qcow;
     QEMUOptionParameter *options;
+    Error *local_err = NULL;
     int ret;
     int size = sector2cluster(s, s->sector_count);
     s->used_clusters = calloc(size, 1);
@@ -2917,9 +2918,7 @@ static int enable_write_target(BDRVVVFATState *s)
     s->qcow_filename = g_malloc(1024);
     ret = get_tmp_filename(s->qcow_filename, 1024);
     if (ret < 0) {
-        g_free(s->qcow_filename);
-        s->qcow_filename = NULL;
-        return ret;
+        goto err;
     }
 
     bdrv_qcow = bdrv_find_format("qcow");
@@ -2927,30 +2926,38 @@ static int enable_write_target(BDRVVVFATState *s)
     set_option_parameter_int(options, BLOCK_OPT_SIZE, s->sector_count * 512);
     set_option_parameter(options, BLOCK_OPT_BACKING_FILE, "fat:");
 
-    if (bdrv_create(bdrv_qcow, s->qcow_filename, options) < 0)
-	return -1;
-
-    s->qcow = bdrv_new("");
-    if (s->qcow == NULL) {
-        return -1;
+    ret = bdrv_create(bdrv_qcow, s->qcow_filename, options, &local_err);
+    if (ret < 0) {
+        qerror_report_err(local_err);
+        error_free(local_err);
+        goto err;
     }
 
-    ret = bdrv_open(s->qcow, s->qcow_filename, NULL,
-            BDRV_O_RDWR | BDRV_O_CACHE_WB | BDRV_O_NO_FLUSH, bdrv_qcow);
+    s->qcow = NULL;
+    ret = bdrv_open(&s->qcow, s->qcow_filename, NULL, NULL,
+            BDRV_O_RDWR | BDRV_O_CACHE_WB | BDRV_O_NO_FLUSH, bdrv_qcow,
+            &local_err);
     if (ret < 0) {
-	return ret;
+        qerror_report_err(local_err);
+        error_free(local_err);
+        goto err;
     }
 
 #ifndef _WIN32
     unlink(s->qcow_filename);
 #endif
 
-    s->bs->backing_hd = calloc(sizeof(BlockDriverState), 1);
+    s->bs->backing_hd = bdrv_new("");
     s->bs->backing_hd->drv = &vvfat_write_target;
     s->bs->backing_hd->opaque = g_malloc(sizeof(void*));
     *(void**)s->bs->backing_hd->opaque = s;
 
     return 0;
+
+err:
+    g_free(s->qcow_filename);
+    s->qcow_filename = NULL;
+    return ret;
 }
 
 static void vvfat_close(BlockDriverState *bs)
@@ -2981,7 +2988,7 @@ static BlockDriver bdrv_vvfat = {
 
     .bdrv_read              = vvfat_co_read,
     .bdrv_write             = vvfat_co_write,
-    .bdrv_co_is_allocated   = vvfat_co_is_allocated,
+    .bdrv_co_get_block_status = vvfat_co_get_block_status,
 };
 
 static void bdrv_vvfat_init(void)

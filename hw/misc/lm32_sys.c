@@ -42,10 +42,14 @@ enum {
     R_MAX
 };
 
-#define MAX_TESTNAME_LEN 16
+#define MAX_TESTNAME_LEN 32
+
+#define TYPE_LM32_SYS "lm32-sys"
+#define LM32_SYS(obj) OBJECT_CHECK(LM32SysState, (obj), TYPE_LM32_SYS)
 
 struct LM32SysState {
-    SysBusDevice busdev;
+    SysBusDevice parent_obj;
+
     MemoryRegion iomem;
     uint32_t base;
     uint32_t regs[R_MAX];
@@ -76,7 +80,11 @@ static void sys_write(void *opaque, hwaddr addr,
     case R_PASSFAIL:
         s->regs[addr] = value;
         testname = (char *)s->testname;
-        qemu_log("TC  %-16s %s\n", testname, (value) ? "FAILED" : "OK");
+        fprintf(stderr, "TC  %-*s %s\n", MAX_TESTNAME_LEN,
+                testname, (value) ? "FAILED" : "OK");
+        if (value) {
+            cpu_dump_state(qemu_get_cpu(0), stderr, fprintf, 0);
+        }
         break;
     case R_TESTNAME:
         s->regs[addr] = value;
@@ -104,7 +112,7 @@ static const MemoryRegionOps sys_ops = {
 
 static void sys_reset(DeviceState *d)
 {
-    LM32SysState *s = container_of(d, LM32SysState, busdev.qdev);
+    LM32SysState *s = LM32_SYS(d);
     int i;
 
     for (i = 0; i < R_MAX; i++) {
@@ -115,9 +123,10 @@ static void sys_reset(DeviceState *d)
 
 static int lm32_sys_init(SysBusDevice *dev)
 {
-    LM32SysState *s = FROM_SYSBUS(typeof(*s), dev);
+    LM32SysState *s = LM32_SYS(dev);
 
-    memory_region_init_io(&s->iomem, &sys_ops , s, "sys", R_MAX * 4);
+    memory_region_init_io(&s->iomem, OBJECT(dev), &sys_ops , s,
+                          "sys", R_MAX * 4);
     sysbus_init_mmio(dev, &s->iomem);
 
     /* Note: This device is not created in the board initialization,
@@ -157,7 +166,7 @@ static void lm32_sys_class_init(ObjectClass *klass, void *data)
 }
 
 static const TypeInfo lm32_sys_info = {
-    .name          = "lm32-sys",
+    .name          = TYPE_LM32_SYS,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(LM32SysState),
     .class_init    = lm32_sys_class_init,

@@ -20,9 +20,10 @@
 #define CPU_ALL_H
 
 #include "qemu-common.h"
-#include "qemu/tls.h"
 #include "exec/cpu-common.h"
+#include "exec/memory.h"
 #include "qemu/thread.h"
+#include "qom/cpu.h"
 
 /* some important defines:
  *
@@ -210,11 +211,15 @@ extern unsigned long reserved_va;
 })
 #endif
 
-#define h2g(x) ({ \
+#define h2g_nocheck(x) ({ \
     unsigned long __ret = (unsigned long)(x) - GUEST_BASE; \
+    (abi_ulong)__ret; \
+})
+
+#define h2g(x) ({ \
     /* Check if given address fits target address space */ \
     assert(h2g_valid(x)); \
-    (abi_ulong)__ret; \
+    h2g_nocheck(x); \
 })
 
 #define saddr(x) g2h(x)
@@ -355,12 +360,6 @@ int page_check_range(target_ulong start, target_ulong len, int flags);
 
 CPUArchState *cpu_copy(CPUArchState *env);
 
-void QEMU_NORETURN cpu_abort(CPUArchState *env, const char *fmt, ...)
-    GCC_FMT_ATTR(2, 3);
-extern CPUArchState *first_cpu;
-DECLARE_TLS(CPUArchState *,cpu_single_env);
-#define cpu_single_env tls_var(cpu_single_env)
-
 /* Flags for use in ENV->INTERRUPT_PENDING.
 
    The numbers assigned here are non-sequential in order to preserve
@@ -411,43 +410,10 @@ DECLARE_TLS(CPUArchState *,cpu_single_env);
      | CPU_INTERRUPT_TGT_EXT_3   \
      | CPU_INTERRUPT_TGT_EXT_4)
 
-/* Breakpoint/watchpoint flags */
-#define BP_MEM_READ           0x01
-#define BP_MEM_WRITE          0x02
-#define BP_MEM_ACCESS         (BP_MEM_READ | BP_MEM_WRITE)
-#define BP_STOP_BEFORE_ACCESS 0x04
-#define BP_WATCHPOINT_HIT     0x08
-#define BP_GDB                0x10
-#define BP_CPU                0x20
-
-int cpu_breakpoint_insert(CPUArchState *env, target_ulong pc, int flags,
-                          CPUBreakpoint **breakpoint);
-int cpu_breakpoint_remove(CPUArchState *env, target_ulong pc, int flags);
-void cpu_breakpoint_remove_by_ref(CPUArchState *env, CPUBreakpoint *breakpoint);
-void cpu_breakpoint_remove_all(CPUArchState *env, int mask);
-int cpu_watchpoint_insert(CPUArchState *env, target_ulong addr, target_ulong len,
-                          int flags, CPUWatchpoint **watchpoint);
-int cpu_watchpoint_remove(CPUArchState *env, target_ulong addr,
-                          target_ulong len, int flags);
-void cpu_watchpoint_remove_by_ref(CPUArchState *env, CPUWatchpoint *watchpoint);
-void cpu_watchpoint_remove_all(CPUArchState *env, int mask);
-
-#define SSTEP_ENABLE  0x1  /* Enable simulated HW single stepping */
-#define SSTEP_NOIRQ   0x2  /* Do not use IRQ while single stepping */
-#define SSTEP_NOTIMER 0x4  /* Do not Timers while single stepping */
-
-void cpu_single_step(CPUArchState *env, int enabled);
-
 #if !defined(CONFIG_USER_ONLY)
-
-/* Return the physical page corresponding to a virtual one. Use it
-   only for debugging because no protection checks are done. Return -1
-   if no page found. */
-hwaddr cpu_get_phys_page_debug(CPUArchState *env, target_ulong addr);
 
 /* memory API */
 
-extern int phys_ram_fd;
 extern ram_addr_t ram_size;
 
 /* RAM is pre-allocated and passed into qemu_ram_alloc_from_ptr */
@@ -464,15 +430,13 @@ typedef struct RAMBlock {
      * Writes must take both locks.
      */
     QTAILQ_ENTRY(RAMBlock) next;
-#if defined(__linux__) && !defined(TARGET_S390X)
     int fd;
-#endif
 } RAMBlock;
 
 typedef struct RAMList {
     QemuMutex mutex;
     /* Protected by the iothread lock.  */
-    uint8_t *phys_dirty;
+    unsigned long *dirty_memory[DIRTY_MEMORY_NUM];
     RAMBlock *mru_block;
     /* Protected by the ramlist lock.  */
     QTAILQ_HEAD(, RAMBlock) blocks;
@@ -499,7 +463,7 @@ void qemu_mutex_lock_ramlist(void);
 void qemu_mutex_unlock_ramlist(void);
 #endif /* !CONFIG_USER_ONLY */
 
-int cpu_memory_rw_debug(CPUArchState *env, target_ulong addr,
+int cpu_memory_rw_debug(CPUState *cpu, target_ulong addr,
                         uint8_t *buf, int len, int is_write);
 
 #endif /* CPU_ALL_H */

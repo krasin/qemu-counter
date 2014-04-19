@@ -304,7 +304,8 @@ static void gt64120_pci_mapping(GT64120State *s)
       s->PCI0IO_length = ((s->regs[GT_PCI0IOHD] + 1) - (s->regs[GT_PCI0IOLD] & 0x7f)) << 21;
       isa_mem_base = s->PCI0IO_start;
       if (s->PCI0IO_length) {
-          isa_mmio_setup(&s->PCI0IO_mem, s->PCI0IO_length);
+          memory_region_init_alias(&s->PCI0IO_mem, OBJECT(s), "isa_mmio",
+                                   get_system_io(), 0, s->PCI0IO_length);
           memory_region_add_subregion(get_system_memory(), s->PCI0IO_start,
                                       &s->PCI0IO_mem);
       }
@@ -1108,7 +1109,7 @@ PCIBus *gt64120_register(qemu_irq *pic)
                                 get_system_memory(),
                                 get_system_io(),
                                 PCI_DEVFN(18, 0), 4, TYPE_PCI_BUS);
-    memory_region_init_io(&d->ISD_mem, &isd_mem_ops, d, "isd-mem", 0x1000);
+    memory_region_init_io(&d->ISD_mem, OBJECT(dev), &isd_mem_ops, d, "isd-mem", 0x1000);
 
     pci_create_simple(phb->bus, PCI_DEVFN(0, 0), "gt64120_pci");
     return phb->bus;
@@ -1150,12 +1151,18 @@ static int gt64120_pci_init(PCIDevice *d)
 static void gt64120_pci_class_init(ObjectClass *klass, void *data)
 {
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
     k->init = gt64120_pci_init;
     k->vendor_id = PCI_VENDOR_ID_MARVELL;
     k->device_id = PCI_DEVICE_ID_MARVELL_GT6412X;
     k->revision = 0x10;
     k->class_id = PCI_CLASS_BRIDGE_HOST;
+    /*
+     * PCI-facing part of the host bridge, not usable without the
+     * host-facing part, which can't be device_add'ed, yet.
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo gt64120_pci_info = {

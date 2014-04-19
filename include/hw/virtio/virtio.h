@@ -43,6 +43,8 @@
 /* We notify when the ring is completely used, even if the guest is suppressing
  * callbacks */
 #define VIRTIO_F_NOTIFY_ON_EMPTY        24
+/* Can the device handle any descriptor layout? */
+#define VIRTIO_F_ANY_LAYOUT             27
 /* We support indirect buffer descriptors */
 #define VIRTIO_RING_F_INDIRECT_DESC     28
 /* The Guest publishes the used index for which it expects an interrupt
@@ -122,9 +124,13 @@ struct VirtIODevice
 };
 
 typedef struct VirtioDeviceClass {
-    /* This is what a VirtioDevice must implement */
+    /*< private >*/
     DeviceClass parent;
-    int (*init)(VirtIODevice *vdev);
+    /*< public >*/
+
+    /* This is what a VirtioDevice must implement */
+    DeviceRealize realize;
+    DeviceUnrealize unrealize;
     uint32_t (*get_features)(VirtIODevice *vdev, uint32_t requested_features);
     uint32_t (*bad_features)(VirtIODevice *vdev);
     void (*set_features)(VirtIODevice *vdev, uint32_t val);
@@ -198,7 +204,9 @@ void virtio_config_writew(VirtIODevice *vdev, uint32_t addr, uint32_t data);
 void virtio_config_writel(VirtIODevice *vdev, uint32_t addr, uint32_t data);
 void virtio_queue_set_addr(VirtIODevice *vdev, int n, hwaddr addr);
 hwaddr virtio_queue_get_addr(VirtIODevice *vdev, int n);
+void virtio_queue_set_num(VirtIODevice *vdev, int n, int num);
 int virtio_queue_get_num(VirtIODevice *vdev, int n);
+void virtio_queue_set_align(VirtIODevice *vdev, int n, int align);
 void virtio_queue_notify(VirtIODevice *vdev, int n);
 uint16_t virtio_queue_vector(VirtIODevice *vdev, int n);
 void virtio_queue_set_vector(VirtIODevice *vdev, int n, uint16_t vector);
@@ -233,6 +241,7 @@ hwaddr virtio_queue_get_used_size(VirtIODevice *vdev, int n);
 hwaddr virtio_queue_get_ring_size(VirtIODevice *vdev, int n);
 uint16_t virtio_queue_get_last_avail_idx(VirtIODevice *vdev, int n);
 void virtio_queue_set_last_avail_idx(VirtIODevice *vdev, int n, uint16_t idx);
+void virtio_queue_invalidate_signalled_used(VirtIODevice *vdev, int n);
 VirtQueue *virtio_get_queue(VirtIODevice *vdev, int n);
 uint16_t virtio_get_queue_index(VirtQueue *vq);
 int virtio_queue_get_id(VirtQueue *vq);

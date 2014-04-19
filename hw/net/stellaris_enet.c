@@ -42,8 +42,13 @@ do { fprintf(stderr, "stellaris_enet: error: " fmt , ## __VA_ARGS__);} while (0)
 #define SE_TCTL_CRC     0x04
 #define SE_TCTL_DUPLEX  0x08
 
+#define TYPE_STELLARIS_ENET "stellaris_enet"
+#define STELLARIS_ENET(obj) \
+    OBJECT_CHECK(stellaris_enet_state, (obj), TYPE_STELLARIS_ENET)
+
 typedef struct {
-    SysBusDevice busdev;
+    SysBusDevice parent_obj;
+
     uint32_t ris;
     uint32_t im;
     uint32_t rctl;
@@ -171,7 +176,8 @@ static uint64_t stellaris_enet_read(void *opaque, hwaddr offset,
         return val;
     case 0x14: /* IA0 */
         return s->conf.macaddr.a[0] | (s->conf.macaddr.a[1] << 8)
-               | (s->conf.macaddr.a[2] << 16) | (s->conf.macaddr.a[3] << 24);
+            | (s->conf.macaddr.a[2] << 16)
+            | ((uint32_t)s->conf.macaddr.a[3] << 24);
     case 0x18: /* IA1 */
         return s->conf.macaddr.a[4] | (s->conf.macaddr.a[5] << 8);
     case 0x1c: /* THR */
@@ -386,11 +392,7 @@ static void stellaris_enet_cleanup(NetClientState *nc)
 {
     stellaris_enet_state *s = qemu_get_nic_opaque(nc);
 
-    unregister_savevm(&s->busdev.qdev, "stellaris_enet", s);
-
-    memory_region_destroy(&s->mmio);
-
-    g_free(s);
+    s->nic = NULL;
 }
 
 static NetClientInfo net_stellaris_enet_info = {
@@ -401,24 +403,34 @@ static NetClientInfo net_stellaris_enet_info = {
     .cleanup = stellaris_enet_cleanup,
 };
 
-static int stellaris_enet_init(SysBusDevice *dev)
+static int stellaris_enet_init(SysBusDevice *sbd)
 {
-    stellaris_enet_state *s = FROM_SYSBUS(stellaris_enet_state, dev);
+    DeviceState *dev = DEVICE(sbd);
+    stellaris_enet_state *s = STELLARIS_ENET(dev);
 
-    memory_region_init_io(&s->mmio, &stellaris_enet_ops, s, "stellaris_enet",
-                          0x1000);
-    sysbus_init_mmio(dev, &s->mmio);
-    sysbus_init_irq(dev, &s->irq);
+    memory_region_init_io(&s->mmio, OBJECT(s), &stellaris_enet_ops, s,
+                          "stellaris_enet", 0x1000);
+    sysbus_init_mmio(sbd, &s->mmio);
+    sysbus_init_irq(sbd, &s->irq);
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
 
     s->nic = qemu_new_nic(&net_stellaris_enet_info, &s->conf,
-                          object_get_typename(OBJECT(dev)), dev->qdev.id, s);
+                          object_get_typename(OBJECT(dev)), dev->id, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
 
     stellaris_enet_reset(s);
-    register_savevm(&s->busdev.qdev, "stellaris_enet", -1, 1,
+    register_savevm(dev, "stellaris_enet", -1, 1,
                     stellaris_enet_save, stellaris_enet_load, s);
     return 0;
+}
+
+static void stellaris_enet_unrealize(DeviceState *dev, Error **errp)
+{
+    stellaris_enet_state *s = STELLARIS_ENET(dev);
+
+    unregister_savevm(DEVICE(s), "stellaris_enet", s);
+
+    memory_region_destroy(&s->mmio);
 }
 
 static Property stellaris_enet_properties[] = {
@@ -432,11 +444,12 @@ static void stellaris_enet_class_init(ObjectClass *klass, void *data)
     SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
 
     k->init = stellaris_enet_init;
+    dc->unrealize = stellaris_enet_unrealize;
     dc->props = stellaris_enet_properties;
 }
 
 static const TypeInfo stellaris_enet_info = {
-    .name          = "stellaris_enet",
+    .name          = TYPE_STELLARIS_ENET,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(stellaris_enet_state),
     .class_init    = stellaris_enet_class_init,

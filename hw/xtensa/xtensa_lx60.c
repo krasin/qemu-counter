@@ -40,6 +40,7 @@
 #include "xtensa_bootparam.h"
 
 typedef struct LxBoardDesc {
+    hwaddr flash_base;
     size_t flash_size;
     size_t flash_sector_size;
     size_t sram_size;
@@ -109,7 +110,7 @@ static Lx60FpgaState *lx60_fpga_init(MemoryRegion *address_space,
 {
     Lx60FpgaState *s = g_malloc(sizeof(Lx60FpgaState));
 
-    memory_region_init_io(&s->iomem, &lx60_fpga_ops, s,
+    memory_region_init_io(&s->iomem, NULL, &lx60_fpga_ops, s,
             "lx60.fpga", 0x10000);
     memory_region_add_subregion(address_space, base, &s->iomem);
     lx60_fpga_reset(s);
@@ -139,14 +140,16 @@ static void lx60_net_init(MemoryRegion *address_space,
             sysbus_mmio_get_region(s, 1));
 
     ram = g_malloc(sizeof(*ram));
-    memory_region_init_ram(ram, "open_eth.ram", 16384);
+    memory_region_init_ram(ram, OBJECT(s), "open_eth.ram", 16384);
     vmstate_register_ram_global(ram);
     memory_region_add_subregion(address_space, buffers, ram);
 }
 
-static uint64_t translate_phys_addr(void *env, uint64_t addr)
+static uint64_t translate_phys_addr(void *opaque, uint64_t addr)
 {
-    return cpu_get_phys_page_debug(env, addr);
+    XtensaCPU *cpu = opaque;
+
+    return cpu_get_phys_page_debug(CPU(cpu), addr);
 }
 
 static void lx60_reset(void *opaque)
@@ -195,12 +198,12 @@ static void lx_init(const LxBoardDesc *board, QEMUMachineInitArgs *args)
     }
 
     ram = g_malloc(sizeof(*ram));
-    memory_region_init_ram(ram, "lx60.dram", args->ram_size);
+    memory_region_init_ram(ram, NULL, "lx60.dram", args->ram_size);
     vmstate_register_ram_global(ram);
     memory_region_add_subregion(system_memory, 0, ram);
 
     system_io = g_malloc(sizeof(*system_io));
-    memory_region_init(system_io, "lx60.io", 224 * 1024 * 1024);
+    memory_region_init(system_io, NULL, "lx60.io", 224 * 1024 * 1024);
     memory_region_add_subregion(system_memory, 0xf0000000, system_io);
     lx60_fpga_init(system_io, 0x0d020000);
     if (nd_table[0].used) {
@@ -217,7 +220,7 @@ static void lx_init(const LxBoardDesc *board, QEMUMachineInitArgs *args)
 
     dinfo = drive_get(IF_PFLASH, 0, 0);
     if (dinfo) {
-        flash = pflash_cfi01_register(0xf8000000,
+        flash = pflash_cfi01_register(board->flash_base,
                 NULL, "lx60.io.flash", board->flash_size,
                 dinfo->bdrv, board->flash_sector_size,
                 board->flash_size / board->flash_sector_size,
@@ -231,7 +234,7 @@ static void lx_init(const LxBoardDesc *board, QEMUMachineInitArgs *args)
     /* Use presence of kernel file name as 'boot from SRAM' switch. */
     if (kernel_filename) {
         rom = g_malloc(sizeof(*rom));
-        memory_region_init_ram(rom, "lx60.sram", board->sram_size);
+        memory_region_init_ram(rom, NULL, "lx60.sram", board->sram_size);
         vmstate_register_ram_global(rom);
         memory_region_add_subregion(system_memory, 0xfe000000, rom);
 
@@ -252,7 +255,7 @@ static void lx_init(const LxBoardDesc *board, QEMUMachineInitArgs *args)
         }
         uint64_t elf_entry;
         uint64_t elf_lowaddr;
-        int success = load_elf(kernel_filename, translate_phys_addr, env,
+        int success = load_elf(kernel_filename, translate_phys_addr, cpu,
                 &elf_entry, &elf_lowaddr, NULL, be, ELF_MACHINE, 0);
         if (success > 0) {
             env->pc = elf_entry;
@@ -262,8 +265,10 @@ static void lx_init(const LxBoardDesc *board, QEMUMachineInitArgs *args)
             MemoryRegion *flash_mr = pflash_cfi01_get_memory(flash);
             MemoryRegion *flash_io = g_malloc(sizeof(*flash_io));
 
-            memory_region_init_alias(flash_io, "lx60.flash",
-                    flash_mr, 0, board->flash_size);
+            memory_region_init_alias(flash_io, NULL, "lx60.flash",
+                    flash_mr, 0,
+                    board->flash_size < 0x02000000 ?
+                    board->flash_size : 0x02000000);
             memory_region_add_subregion(system_memory, 0xfe000000,
                     flash_io);
         }
@@ -273,7 +278,8 @@ static void lx_init(const LxBoardDesc *board, QEMUMachineInitArgs *args)
 static void xtensa_lx60_init(QEMUMachineInitArgs *args)
 {
     static const LxBoardDesc lx60_board = {
-        .flash_size = 0x400000,
+        .flash_base = 0xf8000000,
+        .flash_size = 0x00400000,
         .flash_sector_size = 0x10000,
         .sram_size = 0x20000,
     };
@@ -283,11 +289,34 @@ static void xtensa_lx60_init(QEMUMachineInitArgs *args)
 static void xtensa_lx200_init(QEMUMachineInitArgs *args)
 {
     static const LxBoardDesc lx200_board = {
-        .flash_size = 0x1000000,
+        .flash_base = 0xf8000000,
+        .flash_size = 0x01000000,
         .flash_sector_size = 0x20000,
         .sram_size = 0x2000000,
     };
     lx_init(&lx200_board, args);
+}
+
+static void xtensa_ml605_init(QEMUMachineInitArgs *args)
+{
+    static const LxBoardDesc ml605_board = {
+        .flash_base = 0xf8000000,
+        .flash_size = 0x02000000,
+        .flash_sector_size = 0x20000,
+        .sram_size = 0x2000000,
+    };
+    lx_init(&ml605_board, args);
+}
+
+static void xtensa_kc705_init(QEMUMachineInitArgs *args)
+{
+    static const LxBoardDesc kc705_board = {
+        .flash_base = 0xf0000000,
+        .flash_size = 0x08000000,
+        .flash_sector_size = 0x20000,
+        .sram_size = 0x2000000,
+    };
+    lx_init(&kc705_board, args);
 }
 
 static QEMUMachine xtensa_lx60_machine = {
@@ -295,7 +324,6 @@ static QEMUMachine xtensa_lx60_machine = {
     .desc = "lx60 EVB (" XTENSA_DEFAULT_CPU_MODEL ")",
     .init = xtensa_lx60_init,
     .max_cpus = 4,
-    DEFAULT_MACHINE_OPTIONS,
 };
 
 static QEMUMachine xtensa_lx200_machine = {
@@ -303,13 +331,28 @@ static QEMUMachine xtensa_lx200_machine = {
     .desc = "lx200 EVB (" XTENSA_DEFAULT_CPU_MODEL ")",
     .init = xtensa_lx200_init,
     .max_cpus = 4,
-    DEFAULT_MACHINE_OPTIONS,
+};
+
+static QEMUMachine xtensa_ml605_machine = {
+    .name = "ml605",
+    .desc = "ml605 EVB (" XTENSA_DEFAULT_CPU_MODEL ")",
+    .init = xtensa_ml605_init,
+    .max_cpus = 4,
+};
+
+static QEMUMachine xtensa_kc705_machine = {
+    .name = "kc705",
+    .desc = "kc705 EVB (" XTENSA_DEFAULT_CPU_MODEL ")",
+    .init = xtensa_kc705_init,
+    .max_cpus = 4,
 };
 
 static void xtensa_lx_machines_init(void)
 {
     qemu_register_machine(&xtensa_lx60_machine);
     qemu_register_machine(&xtensa_lx200_machine);
+    qemu_register_machine(&xtensa_ml605_machine);
+    qemu_register_machine(&xtensa_kc705_machine);
 }
 
 machine_init(xtensa_lx_machines_init);

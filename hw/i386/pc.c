@@ -53,8 +53,11 @@
 #include "qemu/bitmap.h"
 #include "qemu/config-file.h"
 #include "hw/acpi/acpi.h"
+#include "hw/acpi/cpu_hotplug.h"
 #include "hw/cpu/icc_bus.h"
 #include "hw/boards.h"
+#include "hw/pci/pci_host.h"
+#include "acpi-build.h"
 
 /* debug PC/ISA interrupts */
 //#define DEBUG_IRQ
@@ -75,8 +78,6 @@
 #define FW_CFG_E820_TABLE (FW_CFG_ARCH_LOCAL + 3)
 #define FW_CFG_HPET (FW_CFG_ARCH_LOCAL + 4)
 
-#define IO_APIC_DEFAULT_ADDRESS 0xfec00000
-
 #define E820_NR_ENTRIES		16
 
 struct e820_entry {
@@ -90,7 +91,9 @@ struct e820_table {
     struct e820_entry entry[E820_NR_ENTRIES];
 } QEMU_PACKED __attribute((__aligned__(4)));
 
-static struct e820_table e820_table;
+static struct e820_table e820_reserve;
+static struct e820_entry *e820_table;
+static unsigned e820_entries;
 struct hpet_fw_config hpet_cfg = {.count = UINT8_MAX};
 
 void gsi_handler(void *opaque, int n, int level)
@@ -160,22 +163,24 @@ void cpu_smm_register(cpu_set_smm_t callback, void *arg)
 
 void cpu_smm_update(CPUX86State *env)
 {
-    if (smm_set && smm_arg && env == first_cpu)
+    if (smm_set && smm_arg && CPU(x86_env_get_cpu(env)) == first_cpu) {
         smm_set(!!(env->hflags & HF_SMM_MASK), smm_arg);
+    }
 }
 
 
 /* IRQ handling */
 int cpu_get_pic_interrupt(CPUX86State *env)
 {
+    X86CPU *cpu = x86_env_get_cpu(env);
     int intno;
 
-    intno = apic_get_interrupt(env->apic_state);
+    intno = apic_get_interrupt(cpu->apic_state);
     if (intno >= 0) {
         return intno;
     }
     /* read the irq from the PIC */
-    if (!apic_accept_pic_intr(env->apic_state)) {
+    if (!apic_accept_pic_intr(cpu->apic_state)) {
         return -1;
     }
 
@@ -185,18 +190,18 @@ int cpu_get_pic_interrupt(CPUX86State *env)
 
 static void pic_irq_request(void *opaque, int irq, int level)
 {
-    CPUX86State *env = first_cpu;
+    CPUState *cs = first_cpu;
+    X86CPU *cpu = X86_CPU(cs);
 
     DPRINTF("pic_irqs: %s irq %d\n", level? "raise" : "lower", irq);
-    if (env->apic_state) {
-        while (env) {
-            if (apic_accept_pic_intr(env->apic_state)) {
-                apic_deliver_pic_intr(env->apic_state, level);
+    if (cpu->apic_state) {
+        CPU_FOREACH(cs) {
+            cpu = X86_CPU(cs);
+            if (apic_accept_pic_intr(cpu->apic_state)) {
+                apic_deliver_pic_intr(cpu->apic_state, level);
             }
-            env = env->next_cpu;
         }
     } else {
-        CPUState *cs = CPU(x86_env_get_cpu(env));
         if (level) {
             cpu_interrupt(cs, CPU_INTERRUPT_HARD);
         } else {
@@ -525,7 +530,7 @@ static void port92_initfn(Object *obj)
 {
     Port92State *s = PORT92(obj);
 
-    memory_region_init_io(&s->io, &port92_ops, s, "port92", 1);
+    memory_region_init_io(&s->io, OBJECT(s), &port92_ops, s, "port92", 1);
 
     s->outport = 0;
 }
@@ -542,10 +547,15 @@ static void port92_class_initfn(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->no_user = 1;
     dc->realize = port92_realizefn;
     dc->reset = port92_reset;
     dc->vmsd = &vmstate_port92_isa;
+    /*
+     * Reason: unlike ordinary ISA devices, this one needs additional
+     * wiring: its A20 output line needs to be wired up by
+     * port92_init().
+     */
+    dc->cannot_instantiate_with_device_add_yet = true;
 }
 
 static const TypeInfo port92_info = {
@@ -574,19 +584,32 @@ static void handle_a20_line_change(void *opaque, int irq, int level)
 
 int e820_add_entry(uint64_t address, uint64_t length, uint32_t type)
 {
-    int index = le32_to_cpu(e820_table.count);
+    int index = le32_to_cpu(e820_reserve.count);
     struct e820_entry *entry;
 
-    if (index >= E820_NR_ENTRIES)
-        return -EBUSY;
-    entry = &e820_table.entry[index++];
+    if (type != E820_RAM) {
+        /* old FW_CFG_E820_TABLE entry -- reservations only */
+        if (index >= E820_NR_ENTRIES) {
+            return -EBUSY;
+        }
+        entry = &e820_reserve.entry[index++];
 
-    entry->address = cpu_to_le64(address);
-    entry->length = cpu_to_le64(length);
-    entry->type = cpu_to_le32(type);
+        entry->address = cpu_to_le64(address);
+        entry->length = cpu_to_le64(length);
+        entry->type = cpu_to_le32(type);
 
-    e820_table.count = cpu_to_le32(index);
-    return index;
+        e820_reserve.count = cpu_to_le32(index);
+    }
+
+    /* new "etc/e820" file -- include ram too */
+    e820_table = g_realloc(e820_table,
+                           sizeof(struct e820_entry) * (e820_entries+1));
+    e820_table[e820_entries].address = cpu_to_le64(address);
+    e820_table[e820_entries].length = cpu_to_le64(length);
+    e820_table[e820_entries].type = cpu_to_le32(type);
+    e820_entries++;
+
+    return e820_entries;
 }
 
 /* Calculates the limit to CPU APIC ID values
@@ -637,7 +660,9 @@ static FWCfgState *bochs_bios_init(void)
         fw_cfg_add_bytes(fw_cfg, FW_CFG_SMBIOS_ENTRIES,
                          smbios_table, smbios_len);
     fw_cfg_add_bytes(fw_cfg, FW_CFG_E820_TABLE,
-                     &e820_table, sizeof(e820_table));
+                     &e820_reserve, sizeof(e820_reserve));
+    fw_cfg_add_file(fw_cfg, "etc/e820", e820_table,
+                    sizeof(struct e820_entry) * e820_entries);
 
     fw_cfg_add_bytes(fw_cfg, FW_CFG_HPET, &hpet_cfg, sizeof(hpet_cfg));
     /* allocate memory for the NUMA channel: one (64bit) word for the number
@@ -811,8 +836,8 @@ static void load_linux(FWCfgState *fw_cfg,
 
         initrd_size = get_image_size(initrd_filename);
         if (initrd_size < 0) {
-            fprintf(stderr, "qemu: error reading initrd %s\n",
-                    initrd_filename);
+            fprintf(stderr, "qemu: error reading initrd %s: %s\n",
+                    initrd_filename, strerror(errno));
             exit(1);
         }
 
@@ -886,8 +911,9 @@ void pc_init_ne2k_isa(ISABus *bus, NICInfo *nd)
 
 DeviceState *cpu_get_current_apic(void)
 {
-    if (cpu_single_env) {
-        return cpu_single_env->apic_state;
+    if (current_cpu) {
+        X86CPU *cpu = X86_CPU(current_cpu);
+        return cpu->apic_state;
     } else {
         return NULL;
     }
@@ -908,20 +934,19 @@ static X86CPU *pc_new_cpu(const char *cpu_model, int64_t apic_id,
     X86CPU *cpu;
     Error *local_err = NULL;
 
-    cpu = cpu_x86_create(cpu_model, icc_bridge, errp);
-    if (!cpu) {
-        return cpu;
+    cpu = cpu_x86_create(cpu_model, icc_bridge, &local_err);
+    if (local_err != NULL) {
+        error_propagate(errp, local_err);
+        return NULL;
     }
 
     object_property_set_int(OBJECT(cpu), apic_id, "apic-id", &local_err);
     object_property_set_bool(OBJECT(cpu), true, "realized", &local_err);
 
     if (local_err) {
-        if (cpu != NULL) {
-            object_unref(OBJECT(cpu));
-            cpu = NULL;
-        }
         error_propagate(errp, local_err);
+        object_unref(OBJECT(cpu));
+        cpu = NULL;
     }
     return cpu;
 }
@@ -950,6 +975,13 @@ void pc_hot_add_cpu(const int64_t id, Error **errp)
         return;
     }
 
+    if (apic_id >= ACPI_CPU_HOTPLUG_ID_LIMIT) {
+        error_setg(errp, "Unable to add CPU: %" PRIi64
+                   ", resulting APIC ID (%" PRIi64 ") is too large",
+                   id, apic_id);
+        return;
+    }
+
     icc_bridge = DEVICE(object_resolve_path_type("icc-bridge",
                                                  TYPE_ICC_BRIDGE, NULL));
     pc_new_cpu(current_cpu_model, apic_id, icc_bridge, errp);
@@ -960,6 +992,7 @@ void pc_cpus_init(const char *cpu_model, DeviceState *icc_bridge)
     int i;
     X86CPU *cpu = NULL;
     Error *error = NULL;
+    unsigned long apic_id_limit;
 
     /* init CPUs */
     if (cpu_model == NULL) {
@@ -971,22 +1004,123 @@ void pc_cpus_init(const char *cpu_model, DeviceState *icc_bridge)
     }
     current_cpu_model = cpu_model;
 
+    apic_id_limit = pc_apic_id_limit(max_cpus);
+    if (apic_id_limit > ACPI_CPU_HOTPLUG_ID_LIMIT) {
+        error_report("max_cpus is too large. APIC ID of last CPU is %lu",
+                     apic_id_limit - 1);
+        exit(1);
+    }
+
     for (i = 0; i < smp_cpus; i++) {
         cpu = pc_new_cpu(cpu_model, x86_cpu_apic_id_from_index(i),
                          icc_bridge, &error);
         if (error) {
-            fprintf(stderr, "%s\n", error_get_pretty(error));
+            error_report("%s", error_get_pretty(error));
             error_free(error);
             exit(1);
         }
     }
 
     /* map APIC MMIO area if CPU has APIC */
-    if (cpu && cpu->env.apic_state) {
+    if (cpu && cpu->apic_state) {
         /* XXX: what if the base changes? */
         sysbus_mmio_map_overlap(SYS_BUS_DEVICE(icc_bridge), 0,
                                 APIC_DEFAULT_ADDRESS, 0x1000);
     }
+}
+
+/* pci-info ROM file. Little endian format */
+typedef struct PcRomPciInfo {
+    uint64_t w32_min;
+    uint64_t w32_max;
+    uint64_t w64_min;
+    uint64_t w64_max;
+} PcRomPciInfo;
+
+static void pc_fw_cfg_guest_info(PcGuestInfo *guest_info)
+{
+    PcRomPciInfo *info;
+    Object *pci_info;
+    bool ambiguous = false;
+
+    if (!guest_info->has_pci_info || !guest_info->fw_cfg) {
+        return;
+    }
+    pci_info = object_resolve_path_type("", TYPE_PCI_HOST_BRIDGE, &ambiguous);
+    g_assert(!ambiguous);
+    if (!pci_info) {
+        return;
+    }
+
+    info = g_malloc(sizeof *info);
+    info->w32_min = cpu_to_le64(object_property_get_int(pci_info,
+                                PCI_HOST_PROP_PCI_HOLE_START, NULL));
+    info->w32_max = cpu_to_le64(object_property_get_int(pci_info,
+                                PCI_HOST_PROP_PCI_HOLE_END, NULL));
+    info->w64_min = cpu_to_le64(object_property_get_int(pci_info,
+                                PCI_HOST_PROP_PCI_HOLE64_START, NULL));
+    info->w64_max = cpu_to_le64(object_property_get_int(pci_info,
+                                PCI_HOST_PROP_PCI_HOLE64_END, NULL));
+    /* Pass PCI hole info to guest via a side channel.
+     * Required so guest PCI enumeration does the right thing. */
+    fw_cfg_add_file(guest_info->fw_cfg, "etc/pci-info", info, sizeof *info);
+}
+
+typedef struct PcGuestInfoState {
+    PcGuestInfo info;
+    Notifier machine_done;
+} PcGuestInfoState;
+
+static
+void pc_guest_info_machine_done(Notifier *notifier, void *data)
+{
+    PcGuestInfoState *guest_info_state = container_of(notifier,
+                                                      PcGuestInfoState,
+                                                      machine_done);
+    pc_fw_cfg_guest_info(&guest_info_state->info);
+    acpi_setup(&guest_info_state->info);
+}
+
+PcGuestInfo *pc_guest_info_init(ram_addr_t below_4g_mem_size,
+                                ram_addr_t above_4g_mem_size)
+{
+    PcGuestInfoState *guest_info_state = g_malloc0(sizeof *guest_info_state);
+    PcGuestInfo *guest_info = &guest_info_state->info;
+    int i, j;
+
+    guest_info->ram_size_below_4g = below_4g_mem_size;
+    guest_info->ram_size = below_4g_mem_size + above_4g_mem_size;
+    guest_info->apic_id_limit = pc_apic_id_limit(max_cpus);
+    guest_info->apic_xrupt_override = kvm_allows_irq0_override();
+    guest_info->numa_nodes = nb_numa_nodes;
+    guest_info->node_mem = g_memdup(node_mem, guest_info->numa_nodes *
+                                    sizeof *guest_info->node_mem);
+    guest_info->node_cpu = g_malloc0(guest_info->apic_id_limit *
+                                     sizeof *guest_info->node_cpu);
+
+    for (i = 0; i < max_cpus; i++) {
+        unsigned int apic_id = x86_cpu_apic_id_from_index(i);
+        assert(apic_id < guest_info->apic_id_limit);
+        for (j = 0; j < nb_numa_nodes; j++) {
+            if (test_bit(i, node_cpumask[j])) {
+                guest_info->node_cpu[apic_id] = j;
+                break;
+            }
+        }
+    }
+
+    guest_info_state->machine_done.notify = pc_guest_info_machine_done;
+    qemu_add_machine_init_done_notifier(&guest_info_state->machine_done);
+    return guest_info;
+}
+
+/* setup pci memory address space mapping into system address space */
+void pc_pci_as_mapping_init(Object *owner, MemoryRegion *system_memory,
+                            MemoryRegion *pci_address_space)
+{
+    /* Set to lower priority than RAM */
+    memory_region_add_subregion_overlap(system_memory, 0x0,
+                                        pci_address_space, -1);
 }
 
 void pc_acpi_init(const char *default_dsdt)
@@ -1012,10 +1146,10 @@ void pc_acpi_init(const char *default_dsdt)
         opts = qemu_opts_parse(qemu_find_opts("acpi"), arg, 0);
         g_assert(opts != NULL);
 
-        acpi_table_add(opts, &err);
+        acpi_table_add_builtin(opts, &err);
         if (err) {
-            fprintf(stderr, "WARNING: failed to load %s: %s\n", filename,
-                    error_get_pretty(err));
+            error_report("WARNING: failed to load %s: %s", filename,
+                         error_get_pretty(err));
             error_free(err);
         }
         g_free(arg);
@@ -1030,7 +1164,8 @@ FWCfgState *pc_memory_init(MemoryRegion *system_memory,
                            ram_addr_t below_4g_mem_size,
                            ram_addr_t above_4g_mem_size,
                            MemoryRegion *rom_memory,
-                           MemoryRegion **ram_memory)
+                           MemoryRegion **ram_memory,
+                           PcGuestInfo *guest_info)
 {
     int linux_boot, i;
     MemoryRegion *ram, *option_rom_mr;
@@ -1044,28 +1179,30 @@ FWCfgState *pc_memory_init(MemoryRegion *system_memory,
      * with older qemus that used qemu_ram_alloc().
      */
     ram = g_malloc(sizeof(*ram));
-    memory_region_init_ram(ram, "pc.ram",
+    memory_region_init_ram(ram, NULL, "pc.ram",
                            below_4g_mem_size + above_4g_mem_size);
     vmstate_register_ram_global(ram);
     *ram_memory = ram;
     ram_below_4g = g_malloc(sizeof(*ram_below_4g));
-    memory_region_init_alias(ram_below_4g, "ram-below-4g", ram,
+    memory_region_init_alias(ram_below_4g, NULL, "ram-below-4g", ram,
                              0, below_4g_mem_size);
     memory_region_add_subregion(system_memory, 0, ram_below_4g);
+    e820_add_entry(0, below_4g_mem_size, E820_RAM);
     if (above_4g_mem_size > 0) {
         ram_above_4g = g_malloc(sizeof(*ram_above_4g));
-        memory_region_init_alias(ram_above_4g, "ram-above-4g", ram,
+        memory_region_init_alias(ram_above_4g, NULL, "ram-above-4g", ram,
                                  below_4g_mem_size, above_4g_mem_size);
         memory_region_add_subregion(system_memory, 0x100000000ULL,
                                     ram_above_4g);
+        e820_add_entry(0x100000000ULL, above_4g_mem_size, E820_RAM);
     }
 
 
     /* Initialize PC system firmware */
-    pc_system_firmware_init(rom_memory);
+    pc_system_firmware_init(rom_memory, guest_info->isapc_ram_fw);
 
     option_rom_mr = g_malloc(sizeof(*option_rom_mr));
-    memory_region_init_ram(option_rom_mr, "pc.rom", PC_ROM_SIZE);
+    memory_region_init_ram(option_rom_mr, NULL, "pc.rom", PC_ROM_SIZE);
     vmstate_register_ram_global(option_rom_mr);
     memory_region_add_subregion_overlap(rom_memory,
                                         PC_ROM_MIN_VGA,
@@ -1082,6 +1219,7 @@ FWCfgState *pc_memory_init(MemoryRegion *system_memory,
     for (i = 0; i < nb_option_roms; i++) {
         rom_add_option(option_rom[i].name, option_rom[i].bootindex);
     }
+    guest_info->fw_cfg = fw_cfg;
     return fw_cfg;
 }
 
@@ -1106,10 +1244,10 @@ DeviceState *pc_vga_init(ISABus *isa_bus, PCIBus *pci_bus)
 
 static void cpu_request_exit(void *opaque, int irq, int level)
 {
-    CPUX86State *env = cpu_single_env;
+    CPUState *cpu = current_cpu;
 
-    if (env && level) {
-        cpu_exit(CPU(x86_env_get_cpu(env)));
+    if (cpu && level) {
+        cpu_exit(cpu);
     }
 }
 
@@ -1136,7 +1274,8 @@ static const MemoryRegionOps ioportF0_io_ops = {
 void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
                           ISADevice **rtc_state,
                           ISADevice **floppy,
-                          bool no_vmport)
+                          bool no_vmport,
+                          uint32 hpet_irqs)
 {
     int i;
     DriveInfo *fd[MAX_FD];
@@ -1150,10 +1289,10 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
     MemoryRegion *ioport80_io = g_new(MemoryRegion, 1);
     MemoryRegion *ioportF0_io = g_new(MemoryRegion, 1);
 
-    memory_region_init_io(ioport80_io, &ioport80_io_ops, NULL, "ioport80", 1);
+    memory_region_init_io(ioport80_io, NULL, &ioport80_io_ops, NULL, "ioport80", 1);
     memory_region_add_subregion(isa_bus->address_space_io, 0x80, ioport80_io);
 
-    memory_region_init_io(ioportF0_io, &ioportF0_io_ops, NULL, "ioportF0", 1);
+    memory_region_init_io(ioportF0_io, NULL, &ioportF0_io_ops, NULL, "ioportF0", 1);
     memory_region_add_subregion(isa_bus->address_space_io, 0xf0, ioportF0_io);
 
     /*
@@ -1163,9 +1302,21 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
      * when the HPET wants to take over. Thus we have to disable the latter.
      */
     if (!no_hpet && (!kvm_irqchip_in_kernel() || kvm_has_pit_state2())) {
-        hpet = sysbus_try_create_simple("hpet", HPET_BASE, NULL);
-
+        /* In order to set property, here not using sysbus_try_create_simple */
+        hpet = qdev_try_create(NULL, TYPE_HPET);
         if (hpet) {
+            /* For pc-piix-*, hpet's intcap is always IRQ2. For pc-q35-1.7
+             * and earlier, use IRQ2 for compat. Otherwise, use IRQ16~23,
+             * IRQ8 and IRQ2.
+             */
+            uint8_t compat = object_property_get_int(OBJECT(hpet),
+                    HPET_INTCAP, NULL);
+            if (!compat) {
+                qdev_prop_set_uint32(hpet, HPET_INTCAP, hpet_irqs);
+            }
+            qdev_init_nofail(hpet);
+            sysbus_mmio_map(SYS_BUS_DEVICE(hpet), 0, HPET_BASE);
+
             for (i = 0; i < GSI_NUM_PINS; i++) {
                 sysbus_connect_irq(SYS_BUS_DEVICE(hpet), i, gsi[i]);
             }
@@ -1203,8 +1354,7 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
         }
     }
 
-    a20_line = qemu_allocate_irqs(handle_a20_line_change,
-                                  x86_env_get_cpu(first_cpu), 2);
+    a20_line = qemu_allocate_irqs(handle_a20_line_change, first_cpu, 2);
     i8042 = isa_create_simple(isa_bus, "i8042");
     i8042_setup_a20_line(i8042, &a20_line[0]);
     if (!no_vmport) {
@@ -1240,7 +1390,7 @@ void pc_nic_init(ISABus *isa_bus, PCIBus *pci_bus)
         if (!pci_bus || (nd->model && strcmp(nd->model, "ne2k_isa") == 0)) {
             pc_init_ne2k_isa(isa_bus, nd);
         } else {
-            pci_nic_init_nofail(nd, "e1000", NULL);
+            pci_nic_init_nofail(nd, pci_bus, "e1000", NULL);
         }
     }
 }
